@@ -1,0 +1,20 @@
+﻿
+@{
+    ViewData["Title"] = "Home Page";
+}
+<script src="~/js/index.js"></script>
+
+
+<div>
+    Please enter an integer: <br/>
+    <input type="text" id="txtNum"/> 
+    <input type="button" id="btnSubmit" value="Get Fib" onclick="getFib()"/> <br/><br/>
+    <label id="lblFib"> </label><br/><br />
+</div>
+
+<div style="height:600px; overflow:auto">
+    <label class="form-label">The following numbers were searched in the past</label>
+    <table class="table table-striped" id="tbl">
+      
+    </table>
+</div>
