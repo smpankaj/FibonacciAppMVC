@@ -9,10 +9,17 @@
     Please enter an integer: <br/>
     <input type="text" id="txtNum"/> 
     <input type="button" id="btnSubmit" value="Get Fib" onclick="getFib()"/> <br/><br/>
-    <label id="lblFib"> </label><br/><br />
+    <div style="width:1200px;height:200px;overflow-y:scroll; word-break: break-all;" id="lblFib">
+    
+    </div>
+   
+    <div class="spinner-border" role="status" id="spinner">
+        <span class="sr-only"></span>
+    </div>
+    
 </div>
 
-<div style="height:600px; overflow:auto">
+<div style="height:600px; width=600px; overflow-x:auto">
     <label class="form-label">The following numbers were searched in the past</label>
     <table class="table table-striped" id="tbl">
       

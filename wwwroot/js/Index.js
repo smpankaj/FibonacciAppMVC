@@ -1,9 +1,12 @@
 ﻿$(document).ready(function () {
     // Get the search history
     getHistory();
+    $('#spinner').hide();
+    $('#lblFib').hide();
 });
 
 function getFib() {
+    $('#lblFib').hide();
     // Clear the table that displays search history
     $("#lblFib").html("");
     var num = $('#txtNum').val();
@@ -17,6 +20,7 @@ function getFib() {
         alert("The number should be greater than 0");
         return;
     }
+    $('#spinner').show();
     var url = "/Home/GetNthFib?num=" + num;
     $.ajax({
         url: url,
@@ -24,7 +28,9 @@ function getFib() {
         contentType: 'application/json',
         success: function (response) {
             console.log("success")
-            $("#lblFib").html("Fibonacci number is " + response);
+            $('#lblFib').show();
+            $("#lblFib").html("Fibonacci number is: </br>" + response);
+            $('#spinner').hide();
             getHistory();
         },
         error: function (response) {
