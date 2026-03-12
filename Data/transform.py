@@ -1,486 +1,645 @@
+# Databricks notebook source
+# COMMAND ----------
+# Run once if needed, then restart Python from Databricks UI if prompted.
+# %pip install -q google-genai beautifulsoup4 lxml nest_asyncio pandas
+
+# COMMAND ----------
 import os
 import re
-import json
 import time
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+import random
+import asyncio
+from datetime import datetime
+from typing import List, Tuple, Dict, Any
 
-from docx import Document
-from openai import OpenAI
-from tqdm import tqdm
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import pandas as pd
+from bs4 import BeautifulSoup, Comment
+from pyspark.sql import functions as F
 
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
 
-# =========================
-# Configuration
-# =========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = "gpt-5.4"
+from google import genai
+from google.genai import types
 
-INPUT_DOCX = "input.docx"
-RULES_FILE = "rules.txt"
-OUTPUT_DOCX = "output_enriched.docx"
+# COMMAND ----------
+# ---------------------------
+# 1) Configuration
+# ---------------------------
+TABLE_NAME = "default.kb_poc_docs"
 
-# First pass: paragraph rewriting
-PARAGRAPH_BATCH_SIZE = 20
-PARAGRAPH_MAX_WORKERS = 4
+ID_COL = "doc_id"          # if missing, notebook auto-generates one
+TEXT_COL = "html_text"     # you said your text column name is html_text
+CAT_COL = "category"       # optional; defaults to "internal" if missing
 
-# Second pass: section cleanup
-SECTION_TARGET_CHARS = 6000
-SECTION_OVERLAP_CHARS = 500
-SECTION_MAX_WORKERS = 3
+N_DOCS = 30                # number of docs to benchmark
+MIN_TEXT_CHARS = 2000      # use longer docs to make chunk parallelism visible
 
-# Retry behavior
-MAX_RETRIES = 5
-INITIAL_BACKOFF_SECONDS = 2
+# Model/API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# If env var is not set, paste directly below:
+# GEMINI_API_KEY = "YOUR_GEMINI_KEY"
 
+MODEL = "gemini-1.5-flash"   # fast + cheaper for benchmarking
+TEMPERATURE = 0.1
 
-# =========================
-# Data structures
-# =========================
-@dataclass
-class ParagraphItem:
-    index: int
-    text: str
-    is_empty: bool
+# Protected tags: text inside these tags is never rewritten
+PROTECTED_TAGS = {"b", "strong"}
 
+# Chunking settings
+MAX_SEGMENT_CHARS = 12000
+CHUNK_TARGET_CHARS = 3500
+CHUNK_HARD_LIMIT_CHARS = 5000
+HARMONIZE_GROUP_CHARS = 8000
 
-@dataclass
-class SectionItem:
-    section_id: int
-    start_index: int
-    end_index: int
-    text: str
+# Retry settings
+MAX_RETRIES = 4
+RETRY_BASE_SECONDS = 1.5
 
+# Parallel benchmark variants
+EXPERIMENTS = [
+    {"variant_id": "A_seq", "max_doc_concurrency": 1, "max_request_concurrency": 1},
+    {"variant_id": "B_chunk_parallel", "max_doc_concurrency": 1, "max_request_concurrency": 4},
+    {"variant_id": "C_doc_and_chunk_parallel", "max_doc_concurrency": 3, "max_request_concurrency": 8},
+]
 
-# =========================
-# Client
-# =========================
-if not OPENAI_API_KEY:
-    raise RuntimeError("Please set OPENAI_API_KEY in your environment.")
+assert GEMINI_API_KEY, "Set GEMINI_API_KEY first."
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# COMMAND ----------
+# ---------------------------
+# 2) Load sample docs
+# ---------------------------
+df = spark.table(TABLE_NAME)
+cols = set(df.columns)
 
+if TEXT_COL not in cols:
+    raise ValueError(f"Column '{TEXT_COL}' not found in table {TABLE_NAME}. Available columns: {sorted(cols)}")
 
-# =========================
-# File I/O
-# =========================
-def read_rules(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+select_cols = []
+if ID_COL in cols:
+    select_cols.append(F.col(ID_COL).cast("string").alias("doc_id"))
+else:
+    select_cols.append(F.monotonically_increasing_id().cast("string").alias("doc_id"))
 
+select_cols.append(F.col(TEXT_COL).cast("string").alias("html_text"))
 
-def read_docx_paragraphs(path: str) -> List[ParagraphItem]:
-    doc = Document(path)
-    items: List[ParagraphItem] = []
+if CAT_COL in cols:
+    select_cols.append(F.col(CAT_COL).cast("string").alias("category"))
+else:
+    select_cols.append(F.lit("internal").alias("category"))
 
-    for i, p in enumerate(doc.paragraphs):
-        text = p.text
-        items.append(
-            ParagraphItem(
-                index=i,
-                text=text,
-                is_empty=(text.strip() == "")
-            )
-        )
-    return items
+sample_df = (
+    df.select(*select_cols)
+      .filter(F.col("html_text").isNotNull())
+      .withColumn("char_len", F.length("html_text"))
+      .filter(F.col("char_len") >= MIN_TEXT_CHARS)
+      .orderBy(F.rand(42))
+      .limit(N_DOCS)
+)
 
-from pathlib import Path
-from docx import Document
-import shutil
-import tempfile
+rows = sample_df.collect()
+docs: List[Tuple[str, str, str]] = [
+    (r["doc_id"], r["html_text"], r["category"] or "internal")
+    for r in rows
+]
 
-def write_docx_from_paragraphs(paragraphs: list[str], output_path: str) -> None:
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp_path = tmp.name
+if not docs:
+    raise ValueError("No docs matched MIN_TEXT_CHARS filter. Lower MIN_TEXT_CHARS and rerun.")
 
-    doc = Document()
-    for p in paragraphs:
-        doc.add_paragraph(p)
-    doc.save(tmp_path)
+print(f"Loaded {len(docs)} docs for benchmark.")
+display(sample_df.select("doc_id", "category", "char_len"))
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(tmp_path, output_path)
+# COMMAND ----------
+# ---------------------------
+# 3) HTML + chunking helpers
+# ---------------------------
+class LLMCallError(Exception):
+    pass
 
-def write_docx_from_paragraphs(paragraphs: List[str], output_path: str) -> None:
-    out = Document()
-    for p in paragraphs:
-        out.add_paragraph(p)
-    out.save(output_path)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
-
-# =========================
-# Utility helpers
-# =========================
-def chunk_list(items: List[Any], batch_size: int) -> List[List[Any]]:
-    return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
-
-
-def extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Tries to recover a JSON object even if the model wraps it in extra text.
-    """
-    text = text.strip()
-
-    # Fast path
+def gemini_text(resp) -> str:
+    txt = getattr(resp, "text", None)
+    if txt:
+        return txt
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+        parts = []
+        for cand in (resp.candidates or []):
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in (getattr(content, "parts", None) or []):
+                t = getattr(part, "text", None)
+                if t:
+                    parts.append(t)
+        return "\n".join(parts)
+    except Exception:
+        return ""
 
-    # Fallback: extract first {...} block
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
+def is_protected_node(node) -> bool:
+    p = node.parent
+    while p is not None and getattr(p, "name", None):
+        if p.name and p.name.lower() in PROTECTED_TAGS:
+            return True
+        p = p.parent
+    return False
 
-    raise ValueError("Could not parse JSON from model output.")
-
-
-def call_with_retries(fn, *args, **kwargs):
-    last_error = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last_error = e
-            if attempt == MAX_RETRIES - 1:
-                raise
-            sleep_s = min(INITIAL_BACKOFF_SECONDS * (2 ** attempt), 30)
-            time.sleep(sleep_s)
-    raise last_error
-
-
-# =========================
-# First pass: paragraph-level rewrite
-# =========================
-def build_paragraph_batch_prompt(rules_text: str, batch: List[ParagraphItem]) -> str:
-    payload = [
-        {"index": item.index, "text": item.text}
-        for item in batch
-        if not item.is_empty
-    ]
-
-    return f"""
-Apply the editorial rules to each paragraph independently.
-
-RULES:
-{rules_text}
-
-INSTRUCTIONS:
-- Rewrite each paragraph so it complies with the rules.
-- Preserve meaning.
-- Preserve names, dates, numbers, URLs, and citations unless a rule explicitly requires changes.
-- Do not merge paragraphs.
-- Do not split paragraphs.
-- Return exactly one rewritten paragraph for each input paragraph.
-- Return ONLY valid JSON.
-- Do not include markdown fences.
-
-Return JSON with this shape:
-{{
-  "items": [
-    {{
-      "index": 12,
-      "rewritten": "Rewritten paragraph text"
-    }}
-  ]
-}}
-
-PARAGRAPHS:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-""".strip()
-
-
-def request_paragraph_batch(batch: List[ParagraphItem], rules_text: str) -> Dict[str, Any]:
-    prompt = build_paragraph_batch_prompt(rules_text, batch)
-
-    response = client.responses.create(
-        model=MODEL,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert editor. Rewrite each paragraph independently. "
-                    "Return only valid JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0,
-    )
-
-    return extract_json_object(response.output_text)
-
-
-def validate_paragraph_batch_result(
-    batch: List[ParagraphItem], result: Dict[str, Any]
-) -> Dict[int, str]:
-    expected_indices = {item.index for item in batch if not item.is_empty}
-    items = result.get("items")
-
-    if not isinstance(items, list):
-        raise ValueError("Result JSON missing 'items' list.")
-
-    rewritten_map: Dict[int, str] = {}
-
-    for obj in items:
-        if not isinstance(obj, dict):
-            raise ValueError("Each item must be an object.")
-        idx = obj.get("index")
-        rewritten = obj.get("rewritten")
-
-        if idx not in expected_indices:
-            raise ValueError(f"Unexpected paragraph index returned: {idx}")
-        if not isinstance(rewritten, str):
-            raise ValueError(f"Paragraph {idx} missing rewritten text.")
-        rewritten_map[idx] = rewritten
-
-    if set(rewritten_map.keys()) != expected_indices:
-        missing = expected_indices - set(rewritten_map.keys())
-        raise ValueError(f"Missing rewritten paragraphs for indices: {sorted(missing)}")
-
-    return rewritten_map
-
-
-def process_paragraph_batch(batch: List[ParagraphItem], rules_text: str) -> Dict[int, str]:
-    # Empty paragraphs are preserved without sending to the model
-    nonempty = [item for item in batch if not item.is_empty]
-    rewritten_map: Dict[int, str] = {item.index: item.text for item in batch if item.is_empty}
-
-    if not nonempty:
-        return rewritten_map
-
-    result = call_with_retries(request_paragraph_batch, nonempty, rules_text)
-    validated = validate_paragraph_batch_result(nonempty, result)
-    rewritten_map.update(validated)
-    return rewritten_map
-
-
-def run_first_pass(paragraphs: List[ParagraphItem], rules_text: str) -> List[str]:
-    batches = chunk_list(paragraphs, PARAGRAPH_BATCH_SIZE)
-    final_map: Dict[int, str] = {p.index: p.text for p in paragraphs}
-
-    with ThreadPoolExecutor(max_workers=PARAGRAPH_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_paragraph_batch, batch, rules_text): batch
-            for batch in batches
-        }
-
-        for future in tqdm(as_completed(futures), total=len(futures), desc="First pass"):
-            batch_result = future.result()
-            final_map.update(batch_result)
-
-    return [final_map[i] for i in range(len(paragraphs))]
-
-
-# =========================
-# Second pass: section-level cleanup
-# =========================
-def build_sections_from_paragraphs(paragraphs: List[str]) -> List[SectionItem]:
-    """
-    Build sections from already-rewritten paragraphs.
-    We use RecursiveCharacterTextSplitter to group paragraphs into larger blocks
-    while trying to preserve paragraph boundaries.
-    """
-    indexed_paragraphs = []
-    for i, p in enumerate(paragraphs):
-        indexed_paragraphs.append(f"[[P{i}]]\n{p}")
-
-    full_text = "\n\n".join(indexed_paragraphs)
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=SECTION_TARGET_CHARS,
-        chunk_overlap=SECTION_OVERLAP_CHARS,
-        separators=["\n\n", "\n", " ", ""],
-    )
-
-    chunks = splitter.split_text(full_text)
-
-    sections: List[SectionItem] = []
-
-    for section_id, chunk in enumerate(chunks):
-        indices = [int(x) for x in re.findall(r"\[\[P(\d+)\]\]", chunk)]
-        if not indices:
+def parse_segments(html_text: str):
+    # Parses HTML and returns all non-empty text nodes as editable segments.
+    soup = BeautifulSoup(html_text, "lxml")
+    segments = []
+    idx = 0
+    for node in soup.find_all(string=True):
+        if isinstance(node, Comment):
             continue
+        txt = str(node)
+        if not txt.strip():
+            continue
+        segments.append({
+            "seg_id": idx,
+            "node": node,
+            "text": txt,
+            "is_protected": is_protected_node(node),
+        })
+        idx += 1
+    return soup, segments
 
-        start_index = min(indices)
-        end_index = max(indices)
+def force_split_text(text: str, hard_limit: int) -> List[str]:
+    parts = []
+    n = len(text)
+    i = 0
+    while i < n:
+        end = min(i + hard_limit, n)
+        if end < n:
+            cut = text.rfind(" ", i, end)
+            if cut > i + hard_limit // 2:
+                end = cut
+        part = text[i:end].strip()
+        if part:
+            parts.append(part)
+        i = end
+        while i < n and text[i].isspace():
+            i += 1
+    return parts
 
-        # Reconstruct clean section text from paragraph range to avoid partial overlaps
-        section_text_parts = []
-        for i in range(start_index, end_index + 1):
-            section_text_parts.append(f"[[P{i}]]\n{paragraphs[i]}")
-        section_text = "\n\n".join(section_text_parts)
+def split_large_paragraph(paragraph: str, hard_limit: int) -> List[str]:
+    sentences = _SENTENCE_SPLIT_RE.split(paragraph.strip())
+    out = []
+    current = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > hard_limit:
+            if current:
+                out.append(current)
+                current = ""
+            out.extend(force_split_text(s, hard_limit))
+            continue
+        candidate = s if not current else f"{current} {s}"
+        if len(candidate) <= hard_limit:
+            current = candidate
+        else:
+            out.append(current)
+            current = s
+    if current:
+        out.append(current)
+    return out
 
-        sections.append(
-            SectionItem(
-                section_id=section_id,
-                start_index=start_index,
-                end_index=end_index,
-                text=section_text,
+def split_text_for_rewrite(text: str, target_chars: int, hard_limit: int) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # Split by paragraph blocks first
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+    atomic_parts = []
+    for p in paragraphs:
+        if len(p) <= hard_limit:
+            atomic_parts.append(p)
+        else:
+            atomic_parts.extend(split_large_paragraph(p, hard_limit))
+
+    # Pack to near target size
+    chunks = []
+    current = ""
+    for part in atomic_parts:
+        sep = "\n\n" if current else ""
+        candidate = f"{current}{sep}{part}"
+        if len(candidate) <= target_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+                current = part
+            else:
+                chunks.append(part)
+                current = ""
+    if current:
+        chunks.append(current)
+
+    # Final hard safety
+    safe = []
+    for c in chunks:
+        if len(c) <= hard_limit:
+            safe.append(c)
+        else:
+            safe.extend(force_split_text(c, hard_limit))
+    return safe
+
+def pack_text_groups(texts: List[str], max_chars: int) -> List[List[str]]:
+    groups = []
+    current = []
+    current_len = 0
+    for t in texts:
+        add_len = len(t) + (2 if current else 0)
+        if current and (current_len + add_len > max_chars):
+            groups.append(current)
+            current = [t]
+            current_len = len(t)
+        else:
+            current.append(t)
+            current_len += add_len
+    if current:
+        groups.append(current)
+    return groups
+
+async def gather_in_batches(coros, batch_size: int = 200):
+    results = []
+    for i in range(0, len(coros), batch_size):
+        results.extend(await asyncio.gather(*coros[i:i + batch_size]))
+    return results
+
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def protected_texts(html_text: str) -> List[str]:
+    soup = BeautifulSoup(html_text, "lxml")
+    out = []
+    for t in soup.find_all(PROTECTED_TAGS):
+        for n in t.find_all(string=True):
+            v = normalize_ws(str(n))
+            if v:
+                out.append(v)
+    return out
+
+# COMMAND ----------
+# ---------------------------
+# 4) Async LLM calls
+# ---------------------------
+async def generate_with_retry_async(
+    user_prompt: str,
+    system_instruction: str,
+    semaphore: asyncio.Semaphore,
+    max_output_tokens: int = 4096,
+) -> str:
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            cfg = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=TEMPERATURE,
+                max_output_tokens=max_output_tokens,
             )
-        )
+            async with semaphore:
+                resp = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=MODEL,
+                    contents=user_prompt,
+                    config=cfg,
+                )
+            return (gemini_text(resp) or "").strip()
+        except Exception as e:
+            last_err = e
+            if attempt == MAX_RETRIES:
+                break
+            sleep_s = RETRY_BASE_SECONDS * (2 ** (attempt - 1)) + random.random()
+            await asyncio.sleep(sleep_s)
 
-    # De-duplicate fully repeated ranges caused by splitter overlap
-    deduped = []
-    seen = set()
-    for s in sections:
-        key = (s.start_index, s.end_index)
-        if key not in seen:
-            deduped.append(s)
-            seen.add(key)
+    raise LLMCallError(str(last_err)) from last_err
 
-    return deduped
+async def rewrite_chunk_async(
+    chunk_text: str,
+    category: str,
+    chunk_idx: int,
+    chunk_total: int,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    system_instruction = (
+        "You are an enterprise technical editor. Rewrite for clarity and professionalism. "
+        "Do not change meaning or facts. Do not change numbers, dates, monetary amounts, URLs, IDs, or deadlines. "
+        "Return plain text only."
+    )
+    user_prompt = f"""
+Category: {category}
+Chunk: {chunk_idx}/{chunk_total}
 
-
-def build_section_prompt(rules_text: str, section: SectionItem) -> str:
-    return f"""
-You are performing a second-pass editorial cleanup on a section of a document.
-
-RULES:
-{rules_text}
-
-GOAL:
-Improve consistency across paragraphs in this section.
-
-FOCUS ON:
-- consistent terminology
-- consistent tone and voice
-- consistent tense where appropriate
-- consistent rule application
-- smoother transitions where useful
-- remove contradictions created by local paragraph rewrites
-
-HARD CONSTRAINTS:
-- Keep the same paragraph count.
-- Keep paragraph markers exactly unchanged.
-- Do not merge paragraphs.
-- Do not split paragraphs.
-- Preserve meaning and factual content.
-- Preserve names, dates, numbers, URLs, and citations unless a rule explicitly requires changes.
-- Return ONLY the revised section text.
-- Every paragraph must remain prefixed by its marker like [[P12]] on its own line.
-
-SECTION TEXT:
-{section.text}
+Rewrite this text:
+{chunk_text}
 """.strip()
 
+    out = await generate_with_retry_async(user_prompt, system_instruction, semaphore)
+    return out if out else chunk_text
 
-def request_section_cleanup(section: SectionItem, rules_text: str) -> str:
-    prompt = build_section_prompt(rules_text, section)
-
-    response = client.responses.create(
-        model=MODEL,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert editor doing a section-level consistency pass. "
-                    "Return only the revised section text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0,
+async def harmonize_group_async(
+    group_texts: List[str],
+    category: str,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    joined = "\n\n".join(group_texts)
+    system_instruction = (
+        "You are an enterprise editor performing harmonization. "
+        "Merge rewritten chunks into one coherent text with consistent tone and flow. "
+        "Do not change meaning, facts, numbers, dates, URLs, IDs, or deadlines. "
+        "Do not add new content. Return plain text only."
     )
+    user_prompt = f"""
+Category: {category}
 
-    return response.output_text.strip()
+Harmonize these rewritten chunks into one continuous text:
+{joined}
+""".strip()
 
+    try:
+        out = await generate_with_retry_async(user_prompt, system_instruction, semaphore)
+        return out if out else joined
+    except Exception:
+        # Fail-open to already rewritten text
+        return joined
 
-def parse_section_output(section_text: str) -> Dict[int, str]:
-    """
-    Parse output in the format:
+# COMMAND ----------
+# ---------------------------
+# 5) Rewriter (segment -> html -> batch)
+# ---------------------------
+async def rewrite_segment_async(
+    text: str,
+    category: str,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    raw = text or ""
+    if not raw.strip():
+        return raw
 
-    [[P10]]
-    Paragraph text...
+    # Preserve surrounding whitespace
+    leading_ws = raw[: len(raw) - len(raw.lstrip())]
+    trailing_ws = raw[len(raw.rstrip()):]
+    core = raw.strip()
 
-    [[P11]]
-    Next paragraph...
-    """
-    matches = list(re.finditer(r"\[\[P(\d+)\]\]\s*\n", section_text))
-    if not matches:
-        raise ValueError("No paragraph markers found in section output.")
+    # Small segment => single request
+    if len(core) <= MAX_SEGMENT_CHARS:
+        rewritten = await rewrite_chunk_async(core, category, 1, 1, semaphore)
+        return f"{leading_ws}{rewritten}{trailing_ws}"
 
-    result: Dict[int, str] = {}
+    # Large segment => chunk + parallel rewrite + hierarchical harmonize
+    chunks = split_text_for_rewrite(core, CHUNK_TARGET_CHARS, CHUNK_HARD_LIMIT_CHARS)
+    if not chunks:
+        return raw
 
-    for i, match in enumerate(matches):
-        idx = int(match.group(1))
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(section_text)
-        para_text = section_text[start:end].strip()
-        result[idx] = para_text
+    coros = [
+        rewrite_chunk_async(ch, category, i + 1, len(chunks), semaphore)
+        for i, ch in enumerate(chunks)
+    ]
+    rewritten_chunks = await gather_in_batches(coros, batch_size=100)
 
-    return result
+    current = rewritten_chunks
+    while len(current) > 1:
+        groups = pack_text_groups(current, HARMONIZE_GROUP_CHARS)
+        coros = [harmonize_group_async(g, category, semaphore) for g in groups]
+        current = await gather_in_batches(coros, batch_size=50)
 
+    final_core = current[0] if current else core
+    return f"{leading_ws}{final_core}{trailing_ws}"
 
-def process_section(section: SectionItem, rules_text: str) -> Dict[int, str]:
-    cleaned = call_with_retries(request_section_cleanup, section, rules_text)
-    parsed = parse_section_output(cleaned)
+async def rewrite_html_async(
+    html_text: str,
+    category: str,
+    request_semaphore: asyncio.Semaphore,
+) -> Tuple[str, Dict[str, Any]]:
+    soup, segments = parse_segments(html_text)
 
-    expected = set(range(section.start_index, section.end_index + 1))
-    returned = set(parsed.keys())
+    editable_idxs = []
+    coros = []
+    protected_count = 0
 
-    if expected != returned:
-        raise ValueError(
-            f"Section {section.section_id} returned wrong paragraph set. "
-            f"Expected {sorted(expected)}, got {sorted(returned)}"
+    for i, seg in enumerate(segments):
+        if seg["is_protected"]:
+            protected_count += 1
+            continue
+        editable_idxs.append(i)
+        coros.append(rewrite_segment_async(seg["text"], category, request_semaphore))
+
+    rewritten_texts = []
+    if coros:
+        rewritten_texts = await gather_in_batches(coros, batch_size=200)
+
+    for i, new_text in zip(editable_idxs, rewritten_texts):
+        segments[i]["node"].replace_with(new_text)
+
+    stats = {
+        "total_segments": len(segments),
+        "editable_segments": len(editable_idxs),
+        "protected_segments": protected_count,
+    }
+    return str(soup), stats
+
+async def rewrite_document_task(
+    doc_id: str,
+    html_text: str,
+    category: str,
+    request_semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    original_protected = protected_texts(html_text)
+
+    try:
+        rewritten_html, seg_stats = await rewrite_html_async(html_text, category, request_semaphore)
+        status = "ok"
+        error = ""
+    except Exception as e:
+        rewritten_html = html_text
+        seg_stats = {"total_segments": 0, "editable_segments": 0, "protected_segments": 0}
+        status = "error"
+        error = str(e)
+
+    t1 = time.perf_counter()
+    rewritten_protected = protected_texts(rewritten_html)
+
+    return {
+        "doc_id": doc_id,
+        "category": category,
+        "status": status,
+        "error": error,
+        "elapsed_sec": round(t1 - t0, 4),
+        "input_chars": len(html_text or ""),
+        "output_chars": len(rewritten_html or ""),
+        "changed": rewritten_html != html_text,
+        "protected_unchanged": original_protected == rewritten_protected,
+        "total_segments": seg_stats["total_segments"],
+        "editable_segments": seg_stats["editable_segments"],
+        "protected_segments": seg_stats["protected_segments"],
+        "rewritten_html": rewritten_html,
+    }
+
+async def rewrite_html_batch_async(
+    docs: List[Tuple[str, str, str]],  # (doc_id, html_text, category)
+    max_doc_concurrency: int,
+    max_request_concurrency: int,
+) -> List[Dict[str, Any]]:
+    request_sem = asyncio.Semaphore(max_request_concurrency)
+    doc_sem = asyncio.Semaphore(max_doc_concurrency)
+
+    async def run_one(doc):
+        doc_id, html_text, category = doc
+        async with doc_sem:
+            return await rewrite_document_task(
+                doc_id=doc_id,
+                html_text=html_text,
+                category=category,
+                request_semaphore=request_sem,
+            )
+
+    coros = [run_one(d) for d in docs]
+    return await gather_in_batches(coros, batch_size=max_doc_concurrency * 10)
+
+# COMMAND ----------
+# ---------------------------
+# 6) Benchmark runner
+# ---------------------------
+async def run_experiment(
+    docs: List[Tuple[str, str, str]],
+    variant_id: str,
+    max_doc_concurrency: int,
+    max_request_concurrency: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    start = time.perf_counter()
+    doc_rows = await rewrite_html_batch_async(
+        docs,
+        max_doc_concurrency=max_doc_concurrency,
+        max_request_concurrency=max_request_concurrency,
+    )
+    wall = time.perf_counter() - start
+
+    total = len(doc_rows)
+    ok = sum(1 for r in doc_rows if r["status"] == "ok")
+    err = total - ok
+    changed = sum(1 for r in doc_rows if r["changed"])
+    protected_ok = sum(1 for r in doc_rows if r["protected_unchanged"])
+    total_chars = sum(r["input_chars"] for r in doc_rows)
+    avg_doc_sec = sum(r["elapsed_sec"] for r in doc_rows) / max(total, 1)
+
+    summary = {
+        "variant_id": variant_id,
+        "max_doc_concurrency": max_doc_concurrency,
+        "max_request_concurrency": max_request_concurrency,
+        "docs_total": total,
+        "docs_ok": ok,
+        "docs_error": err,
+        "wall_time_sec": round(wall, 4),
+        "avg_doc_elapsed_sec": round(avg_doc_sec, 4),
+        "docs_per_min": round((ok / wall) * 60, 4) if wall > 0 else 0.0,
+        "chars_per_sec": round(total_chars / wall, 4) if wall > 0 else 0.0,
+        "changed_rate": round(changed / max(total, 1), 4),
+        "protected_unchanged_rate": round(protected_ok / max(total, 1), 4),
+    }
+
+    for r in doc_rows:
+        r["variant_id"] = variant_id
+
+    return doc_rows, summary
+
+async def run_all_experiments(docs, experiments):
+    all_doc_rows = []
+    summary_rows = []
+    for exp in experiments:
+        print(f"Running {exp['variant_id']} ...")
+        doc_rows, summary = await run_experiment(
+            docs=docs,
+            variant_id=exp["variant_id"],
+            max_doc_concurrency=exp["max_doc_concurrency"],
+            max_request_concurrency=exp["max_request_concurrency"],
         )
+        all_doc_rows.extend(doc_rows)
+        summary_rows.append(summary)
+    return all_doc_rows, summary_rows
 
-    return parsed
+# COMMAND ----------
+# ---------------------------
+# 7) Execute benchmark
+# ---------------------------
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
+all_doc_rows, summary_rows = run_async(run_all_experiments(docs, EXPERIMENTS))
 
-def run_second_pass(paragraphs: List[str], rules_text: str) -> List[str]:
-    sections = build_sections_from_paragraphs(paragraphs)
+summary_pdf = pd.DataFrame(summary_rows).sort_values("docs_per_min", ascending=False)
+display(summary_pdf)
 
-    # A paragraph can appear in multiple overlapping sections.
-    # We keep the latest successful rewrite, but you could also
-    # make this smarter with voting or confidence tracking.
-    revised_map: Dict[int, str] = {i: p for i, p in enumerate(paragraphs)}
+# COMMAND ----------
+# ---------------------------
+# 8) Save results to Delta tables
+# ---------------------------
+RUN_ID = f"parallel_test_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+RUN_TS_UTC = datetime.utcnow().isoformat()
 
-    with ThreadPoolExecutor(max_workers=SECTION_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_section, section, rules_text): section
-            for section in sections
-        }
+for r in summary_rows:
+    r["run_id"] = RUN_ID
+    r["run_ts_utc"] = RUN_TS_UTC
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Second pass"):
-            try:
-                section_result = future.result()
-                revised_map.update(section_result)
-            except Exception as e:
-                # Safe fallback: keep first-pass paragraphs for failed sections
-                print(f"[WARN] Section cleanup failed: {e}")
+for r in all_doc_rows:
+    r["run_id"] = RUN_ID
+    r["run_ts_utc"] = RUN_TS_UTC
 
-    return [revised_map[i] for i in range(len(paragraphs))]
+summary_table = "default.kb_parallel_benchmark_summary"
+detail_table = "default.kb_parallel_benchmark_detail"
 
+spark.createDataFrame(summary_rows).write.mode("append").saveAsTable(summary_table)
+spark.createDataFrame(all_doc_rows).write.mode("append").saveAsTable(detail_table)
 
-# =========================
-# Main
-# =========================
-def main():
-    rules_text = read_rules(RULES_FILE)
-    paragraph_items = read_docx_paragraphs(INPUT_DOCX)
+print("Saved summary table:", summary_table)
+print("Saved detail table :", detail_table)
+print("RUN_ID:", RUN_ID)
 
-    print(f"Loaded {len(paragraph_items)} paragraphs from {INPUT_DOCX}")
+# COMMAND ----------
+# ---------------------------
+# 9) Inspect results
+# ---------------------------
+display(
+    spark.table(summary_table)
+         .filter(F.col("run_id") == RUN_ID)
+         .orderBy(F.col("docs_per_min").desc())
+)
 
-    # First pass
-    first_pass_paragraphs = run_first_pass(paragraph_items, rules_text)
+display(
+    spark.table(detail_table)
+         .filter(F.col("run_id") == RUN_ID)
+         .select(
+             "variant_id", "doc_id", "category", "status", "elapsed_sec",
+             "input_chars", "output_chars", "changed", "protected_unchanged"
+         )
+         .orderBy("variant_id", "elapsed_sec")
+)
 
-    # Second pass
-    final_paragraphs = run_second_pass(first_pass_paragraphs, rules_text)
+# COMMAND ----------
+# ---------------------------
+# 10) Save rewritten HTML for best variant
+# ---------------------------
+best_variant = summary_pdf.iloc[0]["variant_id"]
+best_rows = [r for r in all_doc_rows if r["variant_id"] == best_variant and r["status"] == "ok"]
 
-    # Save
-    write_docx_from_paragraphs(final_paragraphs, OUTPUT_DOCX)
-    print(f"Done. Wrote {OUTPUT_DOCX}")
+best_out_table = "default.kb_poc_rewritten_best_variant"
+spark.createDataFrame(best_rows).select(
+    "doc_id", "category", "variant_id", "rewritten_html", "run_id", "run_ts_utc"
+).write.mode("overwrite").saveAsTable(best_out_table)
 
-
-if __name__ == "__main__":
-
-    main()
+print("Best variant:", best_variant)
+print("Saved rewritten outputs to:", best_out_table)
