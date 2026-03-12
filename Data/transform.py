@@ -643,3 +643,826 @@ spark.createDataFrame(best_rows).select(
 
 print("Best variant:", best_variant)
 print("Saved rewritten outputs to:", best_out_table)
+
+
+
+
+
+
+# ===============================================================
+# DOCX Transformation with OpenAI + LangChain chunking + harmonization
+# Beginner-friendly version with detailed comments
+# ===============================================================
+# Install once if needed:
+# %pip install -q openai python-docx nest_asyncio langchain-text-splitters
+
+import os
+import re
+import random
+import asyncio
+from typing import List
+
+from docx import Document
+from openai import AsyncOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# If you are in a notebook, this avoids "event loop already running" errors.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
+
+
+# ===============================================================
+# 1) USER CONFIGURATION
+# ===============================================================
+
+# Input/output Word file paths
+pathStr = "/dbfs/FileStore/input/my_document.docx"
+output_path = "/dbfs/FileStore/output/my_document_rewritten.docx"
+
+# Rules file: one rule per line (supports 100+ rules)
+rules_file_path = "/dbfs/FileStore/input/rules.txt"
+
+# Document category used in prompt context
+document_category = "internal"  # internal / process_instructions / customer_qa
+
+# OpenAI settings
+# Set key first: os.environ["OPENAI_API_KEY"] = "sk-..."
+MODEL_NAME = "gpt-4.1-mini"
+TEMPERATURE = 0.1
+MAX_OUTPUT_TOKENS = 2500
+
+# Concurrency settings
+MAX_CONCURRENT_REQUESTS = 6      # max in-flight OpenAI calls at once
+ASYNC_BATCH_SIZE = 120           # how many tasks to await per batch
+
+# Retry settings
+MAX_RETRIES = 4
+RETRY_BASE_SECONDS = 1.5
+
+# Chunking settings
+MAX_TEXT_WITHOUT_CHUNKING = 8000  # if text <= this, one call (no chunking)
+TARGET_CHUNK_SIZE = 2500          # preferred chunk size for splitter
+CHUNK_OVERLAP = 0                 # for rewrite pipelines, keep this 0
+HARD_CHUNK_LIMIT = 3500           # final hard safety per chunk
+
+# Harmonization settings
+ENABLE_HARMONIZATION = True
+MAX_HARMONIZE_GROUP_CHARS = 10000
+
+# Formatting protection
+PROTECT_BOLD_TEXT = True          # do not modify run.bold == True
+
+# Optional overlap de-dup guard while combining chunks
+MAX_OVERLAP_DEDUP_CHARS = 300
+
+
+# ===============================================================
+# 2) RULES HELPERS
+# ===============================================================
+
+def load_rules_from_file(file_path: str) -> List[str]:
+    """
+    Load rules from a plain text file.
+    - One rule per line
+    - Empty lines ignored
+    - Lines starting with # are comments and ignored
+    """
+    rules = []
+    with open(file_path, "r", encoding="utf-8") as file_obj:
+        for line in file_obj:
+            cleaned = line.strip()
+            if cleaned == "":
+                continue
+            if cleaned.startswith("#"):
+                continue
+            rules.append(cleaned)
+    return rules
+
+
+def rules_to_numbered_text(rules_list: List[str]) -> str:
+    """
+    Convert list of rules into a numbered block.
+    This is easier for the model to follow.
+    """
+    lines = []
+    index = 1
+    for rule in rules_list:
+        lines.append(str(index) + ". " + rule)
+        index = index + 1
+    return "\n".join(lines)
+
+
+# ===============================================================
+# 3) CHUNKING HELPERS (LangChain splitter + hard safety)
+# ===============================================================
+
+def create_langchain_splitter() -> RecursiveCharacterTextSplitter:
+    """
+    Create a recursive splitter.
+    It tries larger boundaries first (paragraph, newline), then smaller.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". ", " ", ""],
+        chunk_size=TARGET_CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len
+    )
+    return splitter
+
+
+def hard_split_text(text_value: str, max_chars: int) -> List[str]:
+    """
+    Last-resort split by character count.
+    Used only if a chunk still exceeds HARD_CHUNK_LIMIT.
+    """
+    pieces = []
+    start = 0
+    text_value = text_value or ""
+    while start < len(text_value):
+        end = start + max_chars
+        piece = text_value[start:end].strip()
+        if piece != "":
+            pieces.append(piece)
+        start = end
+    return pieces
+
+
+def split_text_into_chunks_langchain(text_value: str, splitter: RecursiveCharacterTextSplitter) -> List[str]:
+    """
+    Split text with LangChain and enforce hard size limit.
+    """
+    text_value = (text_value or "").strip()
+    if text_value == "":
+        return []
+
+    raw_chunks = splitter.split_text(text_value)
+    safe_chunks = []
+
+    for chunk in raw_chunks:
+        chunk = (chunk or "").strip()
+        if chunk == "":
+            continue
+
+        if len(chunk) <= HARD_CHUNK_LIMIT:
+            safe_chunks.append(chunk)
+        else:
+            # If a chunk is still too big, force split it
+            forced = hard_split_text(chunk, HARD_CHUNK_LIMIT)
+            for piece in forced:
+                safe_chunks.append(piece)
+
+    return safe_chunks
+
+
+# ===============================================================
+# 4) PROMPT BUILDERS
+# ===============================================================
+
+def build_rewrite_user_message(category: str, rules_text: str, chunk_text: str, chunk_number: int, total_chunks: int) -> str:
+    """
+    Build an easy-to-read rewrite prompt.
+    """
+    lines = []
+    lines.append("Document category: " + str(category))
+    lines.append("Chunk number: " + str(chunk_number) + " of " + str(total_chunks))
+    lines.append("")
+    lines.append("Apply ALL rules below while preserving meaning and facts.")
+    lines.append("Rules:")
+    lines.append(rules_text)
+    lines.append("")
+    lines.append("Text to rewrite:")
+    lines.append(chunk_text)
+    return "\n".join(lines)
+
+
+def build_harmonize_user_message(category: str, rules_text: str, merged_group_text: str, level_number: int, group_number: int, total_groups: int) -> str:
+    """
+    Build harmonization prompt for one group.
+    """
+    lines = []
+    lines.append("Document category: " + str(category))
+    lines.append("Harmonization level: " + str(level_number))
+    lines.append("Group number: " + str(group_number) + " of " + str(total_groups))
+    lines.append("")
+    lines.append("Task: Make tone and flow consistent across this text.")
+    lines.append("Do NOT change meaning, facts, numbers, dates, URLs, IDs, or deadlines.")
+    lines.append("Do NOT add new information.")
+    lines.append("")
+    lines.append("Rules to respect:")
+    lines.append(rules_text)
+    lines.append("")
+    lines.append("Text to harmonize:")
+    lines.append(merged_group_text)
+    return "\n".join(lines)
+
+
+# ===============================================================
+# 5) OPENAI CALL HELPERS
+# ===============================================================
+
+def extract_response_text(response) -> str:
+    """
+    Safely extract text from OpenAI Responses API output.
+    """
+    direct = getattr(response, "output_text", None)
+    if direct:
+        return direct
+
+    parts = []
+    output_items = getattr(response, "output", None) or []
+    for item in output_items:
+        content = getattr(item, "content", None) or []
+        for c in content:
+            text_val = getattr(c, "text", None)
+            if text_val:
+                parts.append(text_val)
+
+    return "\n".join(parts).strip()
+
+
+async def call_openai_with_retry(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    system_message: str,
+    user_message: str
+) -> str:
+    """
+    Make one OpenAI call with:
+    - Semaphore control (parallelism cap)
+    - Retry/backoff for temporary failures
+    """
+    last_error = None
+    attempt = 1
+
+    while attempt <= MAX_RETRIES:
+        try:
+            async with semaphore:
+                response = await client.responses.create(
+                    model=MODEL_NAME,
+                    temperature=TEMPERATURE,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    input=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": user_message},
+                    ],
+                )
+
+            text_out = extract_response_text(response).strip()
+            return text_out
+
+        except Exception as err:
+            last_error = err
+
+            if attempt == MAX_RETRIES:
+                break
+
+            sleep_seconds = RETRY_BASE_SECONDS * (2 ** (attempt - 1)) + random.random()
+            await asyncio.sleep(sleep_seconds)
+            attempt = attempt + 1
+
+    raise RuntimeError("OpenAI call failed after retries: " + str(last_error))
+
+
+async def gather_in_batches(coros: List[asyncio.Future], batch_size: int, return_exceptions: bool = True):
+    """
+    Await tasks in smaller groups to avoid very large gather calls.
+    """
+    all_results = []
+    start = 0
+
+    while start < len(coros):
+        end = start + batch_size
+        batch = coros[start:end]
+        batch_results = await asyncio.gather(*batch, return_exceptions=return_exceptions)
+        all_results.extend(batch_results)
+        start = end
+
+    return all_results
+
+
+# ===============================================================
+# 6) REWRITE + HARMONIZATION HELPERS
+# ===============================================================
+
+def keep_original_outer_spaces(original_text: str, rewritten_core: str) -> str:
+    """
+    Preserve leading/trailing whitespace from original text.
+    """
+    if original_text is None:
+        return rewritten_core or ""
+
+    left_spaces = original_text[:len(original_text) - len(original_text.lstrip())]
+    right_spaces = original_text[len(original_text.rstrip()):]
+    middle = (rewritten_core or "").strip()
+    return left_spaces + middle + right_spaces
+
+
+def longest_suffix_prefix_overlap(left_text: str, right_text: str, max_check: int) -> int:
+    """
+    Find overlap size where suffix(left_text) == prefix(right_text).
+    Helps avoid accidental duplication if overlap is used.
+    """
+    max_possible = min(len(left_text), len(right_text), max_check)
+
+    # Require at least small overlap size to avoid random small matches.
+    minimum_overlap = 20
+    if max_possible < minimum_overlap:
+        return 0
+
+    size = max_possible
+    while size >= minimum_overlap:
+        if left_text[-size:] == right_text[:size]:
+            return size
+        size = size - 1
+
+    return 0
+
+
+def combine_rewritten_chunks(rewritten_chunks: List[str]) -> str:
+    """
+    Combine chunk outputs into one text.
+    - remove empty chunks
+    - join in order
+    - optional overlap de-dup
+    - normalize too many blank lines
+    """
+    cleaned = []
+    for chunk in rewritten_chunks:
+        value = (chunk or "").strip()
+        if value != "":
+            cleaned.append(value)
+
+    if len(cleaned) == 0:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    merged = cleaned[0]
+    index = 1
+
+    while index < len(cleaned):
+        next_chunk = cleaned[index]
+
+        overlap_size = longest_suffix_prefix_overlap(
+            merged,
+            next_chunk,
+            MAX_OVERLAP_DEDUP_CHARS
+        )
+
+        if overlap_size > 0:
+            merged = merged + next_chunk[overlap_size:]
+        else:
+            merged = merged + "\n\n" + next_chunk
+
+        index = index + 1
+
+    merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
+    return merged
+
+
+async def rewrite_one_chunk(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    category: str,
+    rules_text: str,
+    chunk_text: str,
+    chunk_number: int,
+    total_chunks: int
+) -> str:
+    """
+    Rewrite one chunk.
+    """
+    system_message = (
+        "You are an enterprise editor.\n"
+        "Rewrite for clarity and professionalism.\n"
+        "Do not change meaning or facts.\n"
+        "Do not change numbers, dates, monetary amounts, URLs, IDs, or deadlines.\n"
+        "Return plain text only."
+    )
+
+    user_message = build_rewrite_user_message(
+        category=category,
+        rules_text=rules_text,
+        chunk_text=chunk_text,
+        chunk_number=chunk_number,
+        total_chunks=total_chunks
+    )
+
+    rewritten = await call_openai_with_retry(client, semaphore, system_message, user_message)
+    if rewritten.strip() == "":
+        return chunk_text
+    return rewritten
+
+
+def create_harmonize_groups(text_blocks: List[str], max_chars: int) -> List[List[str]]:
+    """
+    Group text blocks so each group is model-safe in size.
+    """
+    groups = []
+    current_group = []
+    current_len = 0
+
+    for block in text_blocks:
+        block_len = len(block)
+        separator_len = 2 if len(current_group) > 0 else 0
+        candidate_len = current_len + separator_len + block_len
+
+        if candidate_len <= max_chars:
+            current_group.append(block)
+            current_len = candidate_len
+        else:
+            if len(current_group) > 0:
+                groups.append(current_group)
+            current_group = [block]
+            current_len = block_len
+
+    if len(current_group) > 0:
+        groups.append(current_group)
+
+    return groups
+
+
+async def harmonize_one_group(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    category: str,
+    rules_text: str,
+    group_texts: List[str],
+    level_number: int,
+    group_number: int,
+    total_groups: int
+) -> str:
+    """
+    Harmonize one group of already-rewritten chunks.
+    """
+    merged_group_text = combine_rewritten_chunks(group_texts)
+
+    system_message = (
+        "You are an enterprise editor.\n"
+        "Harmonize style and flow only.\n"
+        "Do not change meaning or facts.\n"
+        "Do not change numbers, dates, monetary amounts, URLs, IDs, or deadlines.\n"
+        "Do not add new information.\n"
+        "Return plain text only."
+    )
+
+    user_message = build_harmonize_user_message(
+        category=category,
+        rules_text=rules_text,
+        merged_group_text=merged_group_text,
+        level_number=level_number,
+        group_number=group_number,
+        total_groups=total_groups
+    )
+
+    try:
+        output_text = await call_openai_with_retry(client, semaphore, system_message, user_message)
+        if output_text.strip() == "":
+            return merged_group_text
+        return output_text
+    except Exception:
+        # Fail-open: if harmonization fails, keep original group text
+        return merged_group_text
+
+
+async def harmonize_chunks_hierarchically(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    category: str,
+    rules_text: str,
+    rewritten_chunks: List[str]
+) -> str:
+    """
+    Hierarchical harmonization:
+    - harmonize groups in parallel
+    - then harmonize the group outputs
+    - continue until one final text remains
+    """
+    if len(rewritten_chunks) == 0:
+        return ""
+    if len(rewritten_chunks) == 1:
+        return rewritten_chunks[0]
+
+    current_blocks = rewritten_chunks
+    level_number = 1
+
+    while len(current_blocks) > 1:
+        groups = create_harmonize_groups(current_blocks, MAX_HARMONIZE_GROUP_CHARS)
+
+        tasks = []
+        total_groups = len(groups)
+        group_index = 1
+
+        for group in groups:
+            task = harmonize_one_group(
+                client=client,
+                semaphore=semaphore,
+                category=category,
+                rules_text=rules_text,
+                group_texts=group,
+                level_number=level_number,
+                group_number=group_index,
+                total_groups=total_groups
+            )
+            tasks.append(task)
+            group_index = group_index + 1
+
+        results = await gather_in_batches(tasks, ASYNC_BATCH_SIZE, return_exceptions=True)
+
+        next_blocks = []
+        index = 0
+        while index < len(results):
+            result_item = results[index]
+            original_group_text = combine_rewritten_chunks(groups[index])
+
+            if isinstance(result_item, Exception):
+                next_blocks.append(original_group_text)
+            else:
+                value = (result_item or "").strip()
+                if value == "":
+                    next_blocks.append(original_group_text)
+                else:
+                    next_blocks.append(value)
+
+            index = index + 1
+
+        current_blocks = next_blocks
+        level_number = level_number + 1
+
+    return current_blocks[0]
+
+
+async def rewrite_text_with_rules(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    splitter: RecursiveCharacterTextSplitter,
+    original_text: str,
+    category: str,
+    rules_text: str
+) -> str:
+    """
+    Main rewrite logic for one text unit.
+    - short text => one call
+    - long text => chunk + parallel rewrite + optional harmonization
+    """
+    raw = original_text or ""
+    core = raw.strip()
+
+    if core == "":
+        return raw
+
+    # Short case: one API call
+    if len(core) <= MAX_TEXT_WITHOUT_CHUNKING:
+        rewritten = await rewrite_one_chunk(
+            client=client,
+            semaphore=semaphore,
+            category=category,
+            rules_text=rules_text,
+            chunk_text=core,
+            chunk_number=1,
+            total_chunks=1
+        )
+        return keep_original_outer_spaces(raw, rewritten)
+
+    # Long case: split and rewrite chunks in parallel
+    chunks = split_text_into_chunks_langchain(core, splitter)
+    if len(chunks) == 0:
+        return raw
+
+    tasks = []
+    total_chunks = len(chunks)
+    chunk_index = 1
+
+    for chunk in chunks:
+        task = rewrite_one_chunk(
+            client=client,
+            semaphore=semaphore,
+            category=category,
+            rules_text=rules_text,
+            chunk_text=chunk,
+            chunk_number=chunk_index,
+            total_chunks=total_chunks
+        )
+        tasks.append(task)
+        chunk_index = chunk_index + 1
+
+    results = await gather_in_batches(tasks, ASYNC_BATCH_SIZE, return_exceptions=True)
+
+    # Fail-open: keep original chunk if that chunk rewrite failed
+    rewritten_chunks = []
+    i = 0
+    while i < len(results):
+        result_item = results[i]
+        original_chunk = chunks[i]
+
+        if isinstance(result_item, Exception):
+            rewritten_chunks.append(original_chunk)
+        else:
+            out = (result_item or "").strip()
+            if out == "":
+                rewritten_chunks.append(original_chunk)
+            else:
+                rewritten_chunks.append(out)
+        i = i + 1
+
+    merged = combine_rewritten_chunks(rewritten_chunks)
+
+    # Optional harmonization pass
+    if ENABLE_HARMONIZATION and len(rewritten_chunks) > 1:
+        harmonized = await harmonize_chunks_hierarchically(
+            client=client,
+            semaphore=semaphore,
+            category=category,
+            rules_text=rules_text,
+            rewritten_chunks=rewritten_chunks
+        )
+        if (harmonized or "").strip() != "":
+            merged = harmonized.strip()
+
+    return keep_original_outer_spaces(raw, merged)
+
+
+# ===============================================================
+# 7) DOCX TRAVERSAL HELPERS
+# ===============================================================
+
+def iter_table_paragraphs(table_obj):
+    """
+    Yield paragraphs from a table recursively.
+    """
+    for row in table_obj.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                yield p
+            for nested_table in cell.tables:
+                for nested_p in iter_table_paragraphs(nested_table):
+                    yield nested_p
+
+
+def iter_all_paragraphs(doc_obj: Document):
+    """
+    Yield paragraphs from:
+    - main document body
+    - body tables
+    - headers and footers (and their tables)
+    """
+    # Body paragraphs
+    for p in doc_obj.paragraphs:
+        yield p
+
+    # Body tables
+    for table in doc_obj.tables:
+        for p in iter_table_paragraphs(table):
+            yield p
+
+    # Headers/Footers
+    for section in doc_obj.sections:
+        for p in section.header.paragraphs:
+            yield p
+        for t in section.header.tables:
+            for p in iter_table_paragraphs(t):
+                yield p
+
+        for p in section.footer.paragraphs:
+            yield p
+        for t in section.footer.tables:
+            for p in iter_table_paragraphs(t):
+                yield p
+
+
+# ===============================================================
+# 8) MAIN TRANSFORMATION FUNCTION
+# ===============================================================
+
+async def transform_word_document(
+    input_path: str,
+    output_file_path: str,
+    category: str,
+    rules_path: str
+):
+    """
+    End-to-end transform:
+    1) Load rules
+    2) Load DOCX
+    3) Collect editable runs (skip protected bold runs)
+    4) Rewrite in parallel with semaphore control
+    5) Save rewritten DOCX
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set.")
+
+    # Setup clients/helpers once
+    client = AsyncOpenAI(api_key=api_key)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    splitter = create_langchain_splitter()
+
+    # Load rules
+    rules_list = load_rules_from_file(rules_path)
+    rules_text = rules_to_numbered_text(rules_list)
+
+    # Load document
+    doc = Document(input_path)
+
+    # Collect rewrite jobs
+    # Each job corresponds to one editable run in the DOCX
+    jobs = []
+    total_runs_scanned = 0
+    protected_runs = 0
+
+    for paragraph in iter_all_paragraphs(doc):
+        for run in paragraph.runs:
+            total_runs_scanned = total_runs_scanned + 1
+            run_text = run.text or ""
+
+            if run_text.strip() == "":
+                continue
+
+            # Protect bold runs exactly as requested
+            if PROTECT_BOLD_TEXT and (run.bold is True):
+                protected_runs = protected_runs + 1
+                continue
+
+            jobs.append({
+                "run_obj": run,
+                "original_text": run_text
+            })
+
+    # Build async tasks
+    tasks = []
+    for job in jobs:
+        task = rewrite_text_with_rules(
+            client=client,
+            semaphore=semaphore,
+            splitter=splitter,
+            original_text=job["original_text"],
+            category=category,
+            rules_text=rules_text
+        )
+        tasks.append(task)
+
+    # Execute tasks in parallel batches
+    results = await gather_in_batches(tasks, ASYNC_BATCH_SIZE, return_exceptions=True)
+
+    # Write results back into runs
+    rewritten_runs = 0
+    failed_runs = 0
+
+    index = 0
+    while index < len(jobs):
+        run_obj = jobs[index]["run_obj"]
+        original_text = jobs[index]["original_text"]
+        result_item = results[index]
+
+        if isinstance(result_item, Exception):
+            run_obj.text = original_text  # fail-open
+            failed_runs = failed_runs + 1
+        else:
+            new_text = result_item
+            run_obj.text = new_text
+            if new_text != original_text:
+                rewritten_runs = rewritten_runs + 1
+
+        index = index + 1
+
+    # Save output DOCX
+    doc.save(output_file_path)
+
+    # Return summary stats
+    stats = {
+        "input_path": input_path,
+        "output_path": output_file_path,
+        "model": MODEL_NAME,
+        "rules_loaded": len(rules_list),
+        "total_runs_scanned": total_runs_scanned,
+        "protected_bold_runs": protected_runs,
+        "editable_runs": len(jobs),
+        "rewritten_runs": rewritten_runs,
+        "failed_runs": failed_runs
+    }
+    return stats
+
+
+# ===============================================================
+# 9) RUN
+# ===============================================================
+
+# Notebook usage:
+stats = await transform_word_document(
+    input_path=pathStr,
+    output_file_path=output_path,
+    category=document_category,
+    rules_path=rules_file_path
+)
+
+print("Done. Summary:")
+print(stats)
+
+# Script usage (outside notebook):
+# if __name__ == "__main__":
+#     result = asyncio.run(transform_word_document(pathStr, output_path, document_category, rules_file_path))
+#     print(result)
+
