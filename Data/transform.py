@@ -86,6 +86,22 @@ def read_docx_paragraphs(path: str) -> List[ParagraphItem]:
         )
     return items
 
+from pathlib import Path
+from docx import Document
+import shutil
+import tempfile
+
+def write_docx_from_paragraphs(paragraphs: list[str], output_path: str) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    doc = Document()
+    for p in paragraphs:
+        doc.add_paragraph(p)
+    doc.save(tmp_path)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(tmp_path, output_path)
 
 def write_docx_from_paragraphs(paragraphs: List[str], output_path: str) -> None:
     out = Document()
@@ -466,4 +482,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
