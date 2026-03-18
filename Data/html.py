@@ -1,7 +1,7 @@
 # Databricks notebook source
 # COMMAND ----------
 # Run once if needed, then restart Python from Databricks UI if prompted.
-# %pip install -q google-genai beautifulsoup4 lxml nest_asyncio pandas
+# %pip install -q openai beautifulsoup4 lxml nest_asyncio pandas
 
 # COMMAND ----------
 import os
@@ -19,12 +19,13 @@ from pyspark.sql import functions as F
 
 try:
     import nest_asyncio
+
     nest_asyncio.apply()
 except Exception:
     pass
 
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
+
 
 # COMMAND ----------
 # ---------------------------
@@ -32,23 +33,49 @@ from google.genai import types
 # ---------------------------
 TABLE_NAME = "default.kb_poc_docs"
 
-ID_COL = "doc_id"          # if missing, notebook auto-generates one
-TEXT_COL = "html_text"     # you said your text column name is html_text
-CAT_COL = "category"       # optional; defaults to "internal" if missing
+ID_COL = "doc_id"  # if missing, notebook auto-generates one
+TEXT_COL = "html_text"  # text column
+CAT_COL = "category"  # optional; defaults to "internal" if missing
 
-N_DOCS = 30                # number of docs to benchmark
-MIN_TEXT_CHARS = 2000      # use longer docs to make chunk parallelism visible
+N_DOCS = 30  # number of docs to benchmark
+MIN_TEXT_CHARS = 2000  # use longer docs to make chunk parallelism visible
+SPARK_SAMPLE_FRACTION = 0.1  # avoids full-table random sort
 
 # Model/API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 # If env var is not set, paste directly below:
-# GEMINI_API_KEY = "YOUR_GEMINI_KEY"
+# OPENAI_API_KEY = "YOUR_OPENAI_KEY"
 
-MODEL = "gemini-1.5-flash"   # fast + cheaper for benchmarking
+MODEL = "gpt-4.1-mini"
 TEMPERATURE = 0.1
+MAX_OUTPUT_TOKENS = 4096
+REQUEST_TIMEOUT_SECONDS = 60
+
+# Optional safety confirmation for external LLM calls.
+# If you want hard enforcement, set ENFORCE_EXTERNAL_SEND_CONFIRMATION = True
+# and export ALLOW_EXTERNAL_LLM=true.
+ENFORCE_EXTERNAL_SEND_CONFIRMATION = False
+ALLOW_EXTERNAL_LLM = os.getenv("ALLOW_EXTERNAL_LLM", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # Protected tags: text inside these tags is never rewritten
 PROTECTED_TAGS = {"b", "strong"}
+
+# Non-editable containers: skip rewriting contents to avoid breaking HTML semantics
+NON_EDITABLE_TAGS = {
+    "script",
+    "style",
+    "code",
+    "pre",
+    "title",
+    "noscript",
+    "textarea",
+    "svg",
+    "math",
+}
 
 # Chunking settings
 MAX_SEGMENT_CHARS = 12000
@@ -63,12 +90,24 @@ RETRY_BASE_SECONDS = 1.5
 # Parallel benchmark variants
 EXPERIMENTS = [
     {"variant_id": "A_seq", "max_doc_concurrency": 1, "max_request_concurrency": 1},
-    {"variant_id": "B_chunk_parallel", "max_doc_concurrency": 1, "max_request_concurrency": 4},
-    {"variant_id": "C_doc_and_chunk_parallel", "max_doc_concurrency": 3, "max_request_concurrency": 8},
+    {
+        "variant_id": "B_chunk_parallel",
+        "max_doc_concurrency": 1,
+        "max_request_concurrency": 4,
+    },
+    {
+        "variant_id": "C_doc_and_chunk_parallel",
+        "max_doc_concurrency": 3,
+        "max_request_concurrency": 8,
+    },
 ]
 
-assert GEMINI_API_KEY, "Set GEMINI_API_KEY first."
-client = genai.Client(api_key=GEMINI_API_KEY)
+assert OPENAI_API_KEY, "Set OPENAI_API_KEY first."
+if ENFORCE_EXTERNAL_SEND_CONFIRMATION:
+    assert ALLOW_EXTERNAL_LLM, "Set ALLOW_EXTERNAL_LLM=true to confirm external LLM data egress."
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
 
 # COMMAND ----------
 # ---------------------------
@@ -78,7 +117,9 @@ df = spark.table(TABLE_NAME)
 cols = set(df.columns)
 
 if TEXT_COL not in cols:
-    raise ValueError(f"Column '{TEXT_COL}' not found in table {TABLE_NAME}. Available columns: {sorted(cols)}")
+    raise ValueError(
+        f"Column '{TEXT_COL}' not found in table {TABLE_NAME}. Available columns: {sorted(cols)}"
+    )
 
 select_cols = []
 if ID_COL in cols:
@@ -93,26 +134,42 @@ if CAT_COL in cols:
 else:
     select_cols.append(F.lit("internal").alias("category"))
 
-sample_df = (
+base_df = (
     df.select(*select_cols)
-      .filter(F.col("html_text").isNotNull())
-      .withColumn("char_len", F.length("html_text"))
-      .filter(F.col("char_len") >= MIN_TEXT_CHARS)
-      .orderBy(F.rand(42))
-      .limit(N_DOCS)
+    .filter(F.col("html_text").isNotNull())
+    .withColumn("char_len", F.length("html_text"))
+    .filter(F.col("char_len") >= MIN_TEXT_CHARS)
 )
 
+# More scalable than full orderBy(rand()) over the entire filtered dataset.
+sample_df = (
+    base_df.sample(withReplacement=False, fraction=SPARK_SAMPLE_FRACTION, seed=42)
+    .orderBy(F.rand(42))
+    .limit(N_DOCS)
+)
 rows = sample_df.collect()
+
+# Fallback if sample fraction returns fewer rows than needed.
+if len(rows) < N_DOCS:
+    existing_ids = [r["doc_id"] for r in rows]
+    deficit = N_DOCS - len(rows)
+    filler_df = base_df if not existing_ids else base_df.filter(~F.col("doc_id").isin(existing_ids))
+    rows.extend(filler_df.limit(deficit).collect())
+
 docs: List[Tuple[str, str, str]] = [
-    (r["doc_id"], r["html_text"], r["category"] or "internal")
-    for r in rows
+    (r["doc_id"], r["html_text"], r["category"] or "internal") for r in rows
 ]
 
 if not docs:
     raise ValueError("No docs matched MIN_TEXT_CHARS filter. Lower MIN_TEXT_CHARS and rerun.")
 
 print(f"Loaded {len(docs)} docs for benchmark.")
-display(sample_df.select("doc_id", "category", "char_len"))
+display(
+    spark.createDataFrame(rows)
+    .select("doc_id", "category", "char_len")
+    .orderBy(F.col("char_len").desc())
+)
+
 
 # COMMAND ----------
 # ---------------------------
@@ -121,25 +178,29 @@ display(sample_df.select("doc_id", "category", "char_len"))
 class LLMCallError(Exception):
     pass
 
+
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
-def gemini_text(resp) -> str:
-    txt = getattr(resp, "text", None)
-    if txt:
-        return txt
-    try:
-        parts = []
-        for cand in (resp.candidates or []):
-            content = getattr(cand, "content", None)
-            if not content:
+
+def openai_text(resp) -> str:
+    txt = getattr(resp, "output_text", None)
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+
+    parts: List[str] = []
+    for item in (getattr(resp, "output", None) or []):
+        content_items = getattr(item, "content", None) or []
+        for content in content_items:
+            t = getattr(content, "text", None)
+            if isinstance(t, str) and t.strip():
+                parts.append(t.strip())
                 continue
-            for part in (getattr(content, "parts", None) or []):
-                t = getattr(part, "text", None)
-                if t:
-                    parts.append(t)
-        return "\n".join(parts)
-    except Exception:
-        return ""
+            if isinstance(content, dict):
+                dt = content.get("text") or content.get("output_text")
+                if isinstance(dt, str) and dt.strip():
+                    parts.append(dt.strip())
+    return "\n".join(parts).strip()
+
 
 def is_protected_node(node) -> bool:
     p = node.parent
@@ -149,8 +210,18 @@ def is_protected_node(node) -> bool:
         p = p.parent
     return False
 
+
+def is_non_editable_node(node) -> bool:
+    p = node.parent
+    while p is not None and getattr(p, "name", None):
+        if p.name and p.name.lower() in NON_EDITABLE_TAGS:
+            return True
+        p = p.parent
+    return False
+
+
 def parse_segments(html_text: str):
-    # Parses HTML and returns all non-empty text nodes as editable segments.
+    # Parses HTML and returns all non-empty text nodes as segments with editability metadata.
     soup = BeautifulSoup(html_text, "lxml")
     segments = []
     idx = 0
@@ -160,14 +231,18 @@ def parse_segments(html_text: str):
         txt = str(node)
         if not txt.strip():
             continue
-        segments.append({
-            "seg_id": idx,
-            "node": node,
-            "text": txt,
-            "is_protected": is_protected_node(node),
-        })
+        segments.append(
+            {
+                "seg_id": idx,
+                "node": node,
+                "text": txt,
+                "is_non_editable": is_non_editable_node(node),
+                "is_protected": is_protected_node(node),
+            }
+        )
         idx += 1
     return soup, segments
+
 
 def force_split_text(text: str, hard_limit: int) -> List[str]:
     parts = []
@@ -186,6 +261,7 @@ def force_split_text(text: str, hard_limit: int) -> List[str]:
         while i < n and text[i].isspace():
             i += 1
     return parts
+
 
 def split_large_paragraph(paragraph: str, hard_limit: int) -> List[str]:
     sentences = _SENTENCE_SPLIT_RE.split(paragraph.strip())
@@ -210,6 +286,7 @@ def split_large_paragraph(paragraph: str, hard_limit: int) -> List[str]:
     if current:
         out.append(current)
     return out
+
 
 def split_text_for_rewrite(text: str, target_chars: int, hard_limit: int) -> List[str]:
     text = (text or "").strip()
@@ -253,6 +330,7 @@ def split_text_for_rewrite(text: str, target_chars: int, hard_limit: int) -> Lis
             safe.extend(force_split_text(c, hard_limit))
     return safe
 
+
 def pack_text_groups(texts: List[str], max_chars: int) -> List[List[str]]:
     groups = []
     current = []
@@ -270,14 +348,17 @@ def pack_text_groups(texts: List[str], max_chars: int) -> List[List[str]]:
         groups.append(current)
     return groups
 
+
 async def gather_in_batches(coros, batch_size: int = 200):
     results = []
     for i in range(0, len(coros), batch_size):
-        results.extend(await asyncio.gather(*coros[i:i + batch_size]))
+        results.extend(await asyncio.gather(*coros[i : i + batch_size]))
     return results
+
 
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
 
 def protected_texts(html_text: str) -> List[str]:
     soup = BeautifulSoup(html_text, "lxml")
@@ -289,6 +370,7 @@ def protected_texts(html_text: str) -> List[str]:
                 out.append(v)
     return out
 
+
 # COMMAND ----------
 # ---------------------------
 # 4) Async LLM calls
@@ -297,24 +379,28 @@ async def generate_with_retry_async(
     user_prompt: str,
     system_instruction: str,
     semaphore: asyncio.Semaphore,
-    max_output_tokens: int = 4096,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
 ) -> str:
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            cfg = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=TEMPERATURE,
-                max_output_tokens=max_output_tokens,
-            )
             async with semaphore:
-                resp = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=MODEL,
-                    contents=user_prompt,
-                    config=cfg,
+                resp = await asyncio.wait_for(
+                    client.responses.create(
+                        model=MODEL,
+                        input=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=TEMPERATURE,
+                        max_output_tokens=max_output_tokens,
+                    ),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-            return (gemini_text(resp) or "").strip()
+            out = (openai_text(resp) or "").strip()
+            if out:
+                return out
+            raise LLMCallError("OpenAI returned empty text output.")
         except Exception as e:
             last_err = e
             if attempt == MAX_RETRIES:
@@ -323,6 +409,7 @@ async def generate_with_retry_async(
             await asyncio.sleep(sleep_s)
 
     raise LLMCallError(str(last_err)) from last_err
+
 
 async def rewrite_chunk_async(
     chunk_text: str,
@@ -346,6 +433,7 @@ Rewrite this text:
 
     out = await generate_with_retry_async(user_prompt, system_instruction, semaphore)
     return out if out else chunk_text
+
 
 async def harmonize_group_async(
     group_texts: List[str],
@@ -373,6 +461,7 @@ Harmonize these rewritten chunks into one continuous text:
         # Fail-open to already rewritten text
         return joined
 
+
 # COMMAND ----------
 # ---------------------------
 # 5) Rewriter (segment -> html -> batch)
@@ -388,7 +477,7 @@ async def rewrite_segment_async(
 
     # Preserve surrounding whitespace
     leading_ws = raw[: len(raw) - len(raw.lstrip())]
-    trailing_ws = raw[len(raw.rstrip()):]
+    trailing_ws = raw[len(raw.rstrip()) :]
     core = raw.strip()
 
     # Small segment => single request
@@ -401,10 +490,7 @@ async def rewrite_segment_async(
     if not chunks:
         return raw
 
-    coros = [
-        rewrite_chunk_async(ch, category, i + 1, len(chunks), semaphore)
-        for i, ch in enumerate(chunks)
-    ]
+    coros = [rewrite_chunk_async(ch, category, i + 1, len(chunks), semaphore) for i, ch in enumerate(chunks)]
     rewritten_chunks = await gather_in_batches(coros, batch_size=100)
 
     current = rewritten_chunks
@@ -416,6 +502,19 @@ async def rewrite_segment_async(
     final_core = current[0] if current else core
     return f"{leading_ws}{final_core}{trailing_ws}"
 
+
+async def rewrite_segment_fail_open_async(
+    text: str,
+    category: str,
+    semaphore: asyncio.Semaphore,
+) -> Tuple[str, bool]:
+    try:
+        rewritten = await rewrite_segment_async(text, category, semaphore)
+        return rewritten, False
+    except Exception:
+        return text, True
+
+
 async def rewrite_html_async(
     html_text: str,
     category: str,
@@ -426,27 +525,42 @@ async def rewrite_html_async(
     editable_idxs = []
     coros = []
     protected_count = 0
+    non_editable_count = 0
 
     for i, seg in enumerate(segments):
+        if seg["is_non_editable"]:
+            non_editable_count += 1
+            continue
         if seg["is_protected"]:
             protected_count += 1
             continue
         editable_idxs.append(i)
-        coros.append(rewrite_segment_async(seg["text"], category, request_semaphore))
+        coros.append(rewrite_segment_fail_open_async(seg["text"], category, request_semaphore))
 
-    rewritten_texts = []
+    rewritten_texts: List[Tuple[str, bool]] = []
     if coros:
         rewritten_texts = await gather_in_batches(coros, batch_size=200)
 
-    for i, new_text in zip(editable_idxs, rewritten_texts):
+    changed_segments = 0
+    segment_errors = 0
+    for i, (new_text, had_error) in zip(editable_idxs, rewritten_texts):
+        old_text = segments[i]["text"]
+        if new_text != old_text:
+            changed_segments += 1
+        if had_error:
+            segment_errors += 1
         segments[i]["node"].replace_with(new_text)
 
     stats = {
         "total_segments": len(segments),
         "editable_segments": len(editable_idxs),
         "protected_segments": protected_count,
+        "non_editable_segments": non_editable_count,
+        "changed_segments": changed_segments,
+        "segment_errors": segment_errors,
     }
     return str(soup), stats
+
 
 async def rewrite_document_task(
     doc_id: str,
@@ -459,11 +573,22 @@ async def rewrite_document_task(
 
     try:
         rewritten_html, seg_stats = await rewrite_html_async(html_text, category, request_semaphore)
-        status = "ok"
-        error = ""
+        if seg_stats["segment_errors"] > 0:
+            status = "ok_partial"
+            error = f"{seg_stats['segment_errors']} segment(s) failed and were left unchanged."
+        else:
+            status = "ok"
+            error = ""
     except Exception as e:
         rewritten_html = html_text
-        seg_stats = {"total_segments": 0, "editable_segments": 0, "protected_segments": 0}
+        seg_stats = {
+            "total_segments": 0,
+            "editable_segments": 0,
+            "protected_segments": 0,
+            "non_editable_segments": 0,
+            "changed_segments": 0,
+            "segment_errors": 0,
+        }
         status = "error"
         error = str(e)
 
@@ -478,13 +603,17 @@ async def rewrite_document_task(
         "elapsed_sec": round(t1 - t0, 4),
         "input_chars": len(html_text or ""),
         "output_chars": len(rewritten_html or ""),
-        "changed": rewritten_html != html_text,
+        "changed": seg_stats["changed_segments"] > 0,
+        "changed_segments": seg_stats["changed_segments"],
+        "segment_errors": seg_stats["segment_errors"],
         "protected_unchanged": original_protected == rewritten_protected,
         "total_segments": seg_stats["total_segments"],
         "editable_segments": seg_stats["editable_segments"],
         "protected_segments": seg_stats["protected_segments"],
+        "non_editable_segments": seg_stats["non_editable_segments"],
         "rewritten_html": rewritten_html,
     }
+
 
 async def rewrite_html_batch_async(
     docs: List[Tuple[str, str, str]],  # (doc_id, html_text, category)
@@ -507,6 +636,7 @@ async def rewrite_html_batch_async(
     coros = [run_one(d) for d in docs]
     return await gather_in_batches(coros, batch_size=max_doc_concurrency * 10)
 
+
 # COMMAND ----------
 # ---------------------------
 # 6) Benchmark runner
@@ -526,7 +656,8 @@ async def run_experiment(
     wall = time.perf_counter() - start
 
     total = len(doc_rows)
-    ok = sum(1 for r in doc_rows if r["status"] == "ok")
+    ok = sum(1 for r in doc_rows if r["status"] in {"ok", "ok_partial"})
+    partial = sum(1 for r in doc_rows if r["status"] == "ok_partial")
     err = total - ok
     changed = sum(1 for r in doc_rows if r["changed"])
     protected_ok = sum(1 for r in doc_rows if r["protected_unchanged"])
@@ -539,6 +670,7 @@ async def run_experiment(
         "max_request_concurrency": max_request_concurrency,
         "docs_total": total,
         "docs_ok": ok,
+        "docs_partial": partial,
         "docs_error": err,
         "wall_time_sec": round(wall, 4),
         "avg_doc_elapsed_sec": round(avg_doc_sec, 4),
@@ -552,6 +684,7 @@ async def run_experiment(
         r["variant_id"] = variant_id
 
     return doc_rows, summary
+
 
 async def run_all_experiments(docs, experiments):
     all_doc_rows = []
@@ -568,6 +701,7 @@ async def run_all_experiments(docs, experiments):
         summary_rows.append(summary)
     return all_doc_rows, summary_rows
 
+
 # COMMAND ----------
 # ---------------------------
 # 7) Execute benchmark
@@ -579,10 +713,12 @@ def run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
+
 all_doc_rows, summary_rows = run_async(run_all_experiments(docs, EXPERIMENTS))
 
 summary_pdf = pd.DataFrame(summary_rows).sort_values("docs_per_min", ascending=False)
 display(summary_pdf)
+
 
 # COMMAND ----------
 # ---------------------------
@@ -609,37 +745,57 @@ print("Saved summary table:", summary_table)
 print("Saved detail table :", detail_table)
 print("RUN_ID:", RUN_ID)
 
+
 # COMMAND ----------
 # ---------------------------
 # 9) Inspect results
 # ---------------------------
 display(
     spark.table(summary_table)
-         .filter(F.col("run_id") == RUN_ID)
-         .orderBy(F.col("docs_per_min").desc())
+    .filter(F.col("run_id") == RUN_ID)
+    .orderBy(F.col("docs_per_min").desc())
 )
 
 display(
     spark.table(detail_table)
-         .filter(F.col("run_id") == RUN_ID)
-         .select(
-             "variant_id", "doc_id", "category", "status", "elapsed_sec",
-             "input_chars", "output_chars", "changed", "protected_unchanged"
-         )
-         .orderBy("variant_id", "elapsed_sec")
+    .filter(F.col("run_id") == RUN_ID)
+    .select(
+        "variant_id",
+        "doc_id",
+        "category",
+        "status",
+        "elapsed_sec",
+        "input_chars",
+        "output_chars",
+        "changed",
+        "changed_segments",
+        "segment_errors",
+        "protected_unchanged",
+    )
+    .orderBy("variant_id", "elapsed_sec")
 )
+
 
 # COMMAND ----------
 # ---------------------------
 # 10) Save rewritten HTML for best variant
 # ---------------------------
 best_variant = summary_pdf.iloc[0]["variant_id"]
-best_rows = [r for r in all_doc_rows if r["variant_id"] == best_variant and r["status"] == "ok"]
+best_rows = [r for r in all_doc_rows if r["variant_id"] == best_variant and r["status"] in {"ok", "ok_partial"}]
 
 best_out_table = "default.kb_poc_rewritten_best_variant"
-spark.createDataFrame(best_rows).select(
-    "doc_id", "category", "variant_id", "rewritten_html", "run_id", "run_ts_utc"
-).write.mode("overwrite").saveAsTable(best_out_table)
 
-print("Best variant:", best_variant)
-print("Saved rewritten outputs to:", best_out_table)
+if best_rows:
+    spark.createDataFrame(best_rows).select(
+        "doc_id",
+        "category",
+        "variant_id",
+        "rewritten_html",
+        "run_id",
+        "run_ts_utc",
+    ).write.mode("append").saveAsTable(best_out_table)
+    print("Best variant:", best_variant)
+    print("Saved rewritten outputs to:", best_out_table)
+else:
+    print("Best variant:", best_variant)
+    print("No successful rows to save for best variant; skipped output table write.")
