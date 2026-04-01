@@ -1,0 +1,46 @@
+import google.generativeai as genai
+import os
+
+# 1. Initialize the API (Ensure your API key is in your environment variables)
+genai.configure(api_key=GEMINI_API_KEY )
+
+# 2. Define the strict rules for the LLM
+system_rules = """
+You are a precision copyeditor working with HTML fragments. Your job is to fix spelling and grammar.
+
+CRITICAL RULES:
+1. Do NOT add, remove, or alter any HTML tags. Preserve the exact tag structure.
+2. Contextual Flow: Treat text inside child tags (e.g., <a>, <span>, <li>) as flowing continuously from the parent tags for grammatical context. Do not treat them as separate sentences.
+3. The Bold Rule: You must NEVER modify the spelling, grammar, or content of text enclosed in <b> or <strong> tags, even if it is incorrect.
+4. Output Format: Return ONLY the corrected HTML code. Do not include markdown code blocks (like ```html), greetings, or explanations.
+"""
+
+# 3. Initialize the model with the system instructions
+# gemini-1.5-flash is ideal here: it's fast, cost-effective, and follows system instructions strictly.
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-flash",
+    system_instruction=system_rules
+)
+
+def fix_html_grammar(html_fragment: str) -> str:
+    """Sends an HTML fragment to the LLM for grammar correction."""
+    try:
+        response = model.generate_content(html_fragment)
+        return response.text.strip()
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+# --- Test the Program ---
+if __name__ == "__main__":
+    # Test case includes the flowing context requirement and an intentional typo inside a <b> tag to test the exclusion rule.
+    test_html = """
+    <p>Today is Sunday. Sunday are a great day as they have a lot of <a> activitties </a> </p>  
+    <p>We go to park on Sunday and eat in a nice <span>resturants</span></p>
+    """
+    
+    print("--- Original HTML ---")
+    print(test_html.strip())
+    
+    print("\n--- Corrected HTML ---")
+    corrected_html = fix_html_grammar(test_html)
+    print(corrected_html)
