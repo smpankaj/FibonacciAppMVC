@@ -1,0 +1,1275 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # HTML document rewriter with Azure OpenAI (GPT-5.1) - mixed strategy
+# MAGIC
+# MAGIC This Databricks notebook rewrites HTML documents while trying to balance two goals:
+# MAGIC
+# MAGIC 1. **Keep the language natural**
+# MAGIC 2. **Keep the HTML structure safe**
+# MAGIC
+# MAGIC The notebook uses a **mixed strategy**:
+# MAGIC
+# MAGIC - For simple blocks such as `<p>`, `<li>`, headings, and `<caption>`, it sends **raw HTML**
+# MAGIC   to the model so the model can see the natural structure of the sentence.
+# MAGIC - For **protected bold text** inside those simple blocks, it temporarily replaces the
+# MAGIC   bold tag with visible **KEEP markers** so the model sees the words but is told not to
+# MAGIC   change them.
+# MAGIC - For table cells such as `<td>` and `<th>`, it uses a stricter **marker strategy** for
+# MAGIC   inline tags inside the cell. This gives the model enough textual context while reducing
+# MAGIC   the risk of breaking table structure.
+# MAGIC
+# MAGIC In short:
+# MAGIC
+# MAGIC - paragraphs and simple blocks -> raw HTML + protected markers
+# MAGIC - table cells -> cell-by-cell rewrite with inline markers
+# MAGIC
+# MAGIC The notebook is intentionally written in a beginner-friendly style:
+# MAGIC
+# MAGIC - step-by-step functions
+# MAGIC - detailed comments
+# MAGIC - no list comprehensions
+# MAGIC - clear variable names
+
+# COMMAND ----------
+# MAGIC %pip install --quiet --upgrade openai beautifulsoup4 lxml
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Configuration
+# MAGIC
+# MAGIC Recommended in Databricks:
+# MAGIC
+# MAGIC - Store the Azure OpenAI key in a secret scope, or pass it in as a widget for testing.
+# MAGIC - Set `deployment_name` to your **Azure deployment name** that points to GPT-5.1.
+
+# COMMAND ----------
+import os
+
+try:
+    dbutils.widgets.text("azure_endpoint", "")
+    dbutils.widgets.text("api_key", "")
+    dbutils.widgets.text("api_version", "2024-10-21")
+    dbutils.widgets.text("deployment_name", "")
+except Exception:
+    # This notebook may also be run outside Databricks, so the widgets may not exist.
+    pass
+
+
+# This helper function reads a widget value if it exists.
+# If the widget is missing or empty, it returns the default value.
+def _read_widget(name: str, default_value: str = "") -> str:
+    try:
+        value = dbutils.widgets.get(name)
+        if value:
+            return value
+        return default_value
+    except Exception:
+        return default_value
+
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT") or _read_widget("azure_endpoint")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or _read_widget("api_key")
+OPENAI_API_VERSION = os.getenv("OPENAI_API_VERSION") or _read_widget("api_version", "2024-10-21")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT") or _read_widget("deployment_name")
+
+print({
+    "azure_endpoint_set": bool(AZURE_OPENAI_ENDPOINT),
+    "api_key_set": bool(AZURE_OPENAI_API_KEY),
+    "api_version": OPENAI_API_VERSION,
+    "deployment_name_set": bool(AZURE_OPENAI_DEPLOYMENT),
+})
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Imports and client
+
+# COMMAND ----------
+import json
+import re
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Sequence
+from typing import Tuple
+
+from bs4 import BeautifulSoup
+from bs4 import Comment
+from bs4 import NavigableString
+from bs4 import Tag
+from openai import AzureOpenAI
+
+
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=OPENAI_API_VERSION,
+)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Rewrite rules
+# MAGIC
+# MAGIC Replace this list with your own full rulebook.
+
+# COMMAND ----------
+STYLE_RULES = [
+    "Fix spelling and grammar.",
+    "Prefer active voice when it keeps the meaning accurate.",
+    "Use B1 language level.",
+    "Use concise wording.",
+    "Preserve the original meaning.",
+    "Do not modify any text inside <b> or <strong> tags.",
+]
+
+for rule_index in range(0, len(STYLE_RULES)):
+    print(str(rule_index + 1) + ". " + STYLE_RULES[rule_index])
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Strategy settings
+# MAGIC
+# MAGIC `RAW_HTML_BLOCK_TAGS` are sent as raw HTML, except that protected bold text is replaced
+# MAGIC with visible KEEP markers before the model sees it.
+# MAGIC
+# MAGIC `CELL_BLOCK_TAGS` are handled more strictly. The outer cell tag stays in place, but inline
+# MAGIC tags inside the cell are converted into markers before the model sees the content.
+
+# COMMAND ----------
+RAW_HTML_BLOCK_TAGS = set([
+    "p",
+    "li",
+    "caption",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+])
+
+CELL_BLOCK_TAGS = set([
+    "td",
+    "th",
+])
+
+REWRITE_BLOCK_TAGS = set()
+for tag_name in RAW_HTML_BLOCK_TAGS:
+    REWRITE_BLOCK_TAGS.add(tag_name)
+for tag_name in CELL_BLOCK_TAGS:
+    REWRITE_BLOCK_TAGS.add(tag_name)
+
+PROTECTED_TAGS = set([
+    "b",
+    "strong",
+])
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Parsing helpers
+# MAGIC
+# MAGIC These helpers parse the HTML fragment and find the smallest block elements that we want to
+# MAGIC rewrite safely.
+
+# COMMAND ----------
+
+# This function parses an HTML fragment by wrapping it in a temporary <root> element.
+# Wrapping the fragment makes it easier to handle partial HTML safely.
+def parse_fragment(fragment: str) -> Tuple[BeautifulSoup, Tag]:
+    wrapped_html = "<root>" + fragment + "</root>"
+    soup = BeautifulSoup(wrapped_html, "lxml")
+    root = soup.find("root")
+
+    if root is None:
+        raise ValueError("Could not parse HTML fragment.")
+
+    return soup, root
+
+
+# This function converts everything inside our temporary <root> wrapper back to a plain string.
+# We use it at the very end to return the transformed HTML fragment.
+def fragment_to_string(root: Tag) -> str:
+    output_parts = []
+
+    for child in root.contents:
+        output_parts.append(str(child))
+
+    return "".join(output_parts)
+
+
+# This function returns the "important" children of a tag.
+# It ignores comments and whitespace-only text nodes.
+def significant_children(node: Tag) -> List[object]:
+    children = []
+
+    for child in node.contents:
+        if isinstance(child, Comment):
+            continue
+
+        if isinstance(child, NavigableString):
+            child_text = str(child)
+            if child_text.strip() == "":
+                continue
+            children.append(child)
+            continue
+
+        if isinstance(child, Tag):
+            children.append(child)
+
+    return children
+
+
+# This function checks whether a tag contains another rewriteable block inside it.
+# If it does, then this tag is not a leaf block.
+def contains_descendant_rewrite_block(tag: Tag) -> bool:
+    for descendant in tag.find_all(REWRITE_BLOCK_TAGS):
+        if descendant is not tag:
+            return True
+    return False
+
+
+# This function finds the smallest rewriteable blocks in the document.
+# We call them "leaf blocks" because they are the lowest safe blocks in the HTML tree.
+def find_leaf_rewrite_targets(root: Tag) -> List[Tag]:
+    targets = []
+
+    for tag in root.find_all(REWRITE_BLOCK_TAGS):
+        if contains_descendant_rewrite_block(tag):
+            continue
+        targets.append(tag)
+
+    return targets
+
+
+# This function makes sure that a fragment contains exactly one real root tag.
+# We use it for validation after the model returns a rewritten block.
+def extract_single_tag(fragment: str) -> Tag:
+    soup, root = parse_fragment(fragment)
+    important_children = significant_children(root)
+
+    tag_children = []
+    non_tag_children = []
+
+    for child in important_children:
+        if isinstance(child, Tag):
+            tag_children.append(child)
+        else:
+            non_tag_children.append(child)
+
+    if len(non_tag_children) > 0:
+        raise ValueError("Rewritten block contains text outside the root tag.")
+
+    if len(tag_children) != 1:
+        raise ValueError("Expected exactly one root tag, but found " + str(len(tag_children)) + ".")
+
+    return tag_children[0]
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## HTML comparison helpers
+# MAGIC
+# MAGIC These helpers create normalized signatures so we can compare the original HTML block and the
+# MAGIC rebuilt HTML block after the model rewrite.
+
+# COMMAND ----------
+
+# This function normalizes one attribute value.
+# BeautifulSoup may represent some attributes as lists, so we convert them to strings in a
+# consistent way before comparing them.
+def normalize_attr_value(value) -> object:
+    if isinstance(value, list):
+        normalized_parts = []
+
+        for item in value:
+            normalized_parts.append(str(item))
+
+        return tuple(normalized_parts)
+
+    return str(value)
+
+
+# This function normalizes all attributes for one tag.
+# The output is sorted so that attribute order differences do not create false validation errors.
+def normalize_attrs(tag: Tag) -> Tuple[Tuple[str, object], ...]:
+    pairs = []
+
+    for key, value in tag.attrs.items():
+        normalized_value = normalize_attr_value(value)
+        pairs.append((key, normalized_value))
+
+    pairs.sort()
+    return tuple(pairs)
+
+
+# This function builds a structural signature for a tag and all important descendants.
+# The signature helps us compare structure without being distracted by normal text changes.
+def structure_signature(node: Tag) -> Tuple[object, ...]:
+    signature_parts = []
+
+    for child in significant_children(node):
+        if isinstance(child, NavigableString):
+            signature_parts.append(("TEXT",))
+        elif isinstance(child, Tag):
+            child_signature = structure_signature(child)
+            child_record = (
+                "TAG",
+                child.name,
+                normalize_attrs(child),
+                child_signature,
+            )
+            signature_parts.append(child_record)
+
+    return tuple(signature_parts)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Marker helpers
+# MAGIC
+# MAGIC The notebook uses two kinds of markers:
+# MAGIC
+# MAGIC 1. **KEEP markers**
+# MAGIC    - used for text that must not be changed, such as text inside `<b>` and `<strong>`
+# MAGIC 2. **INLINE markers**
+# MAGIC    - used inside table cells to protect inline tags such as `<a>` and `<span>` while still
+# MAGIC      letting the model see and rewrite the text inside those tags
+
+# COMMAND ----------
+
+# This function creates a KEEP start marker string such as:
+# MAGIC # ⟦KEEP_1_START⟧
+def build_keep_start_marker(marker_number: int) -> str:
+    return "⟦KEEP_" + str(marker_number) + "_START⟧"
+
+
+# This function creates a KEEP end marker string such as:
+# MAGIC # ⟦KEEP_1_END⟧
+def build_keep_end_marker(marker_number: int) -> str:
+    return "⟦KEEP_" + str(marker_number) + "_END⟧"
+
+
+# This function creates an INLINE start marker string such as:
+# MAGIC # ⟦TAG_1_START⟧
+def build_inline_start_marker(marker_number: int) -> str:
+    return "⟦TAG_" + str(marker_number) + "_START⟧"
+
+
+# This function creates an INLINE end marker string such as:
+# MAGIC # ⟦TAG_" + str(marker_number) + "_END⟧
+def build_inline_end_marker(marker_number: int) -> str:
+    return "⟦TAG_" + str(marker_number) + "_END⟧"
+
+
+# This function creates a single marker for empty tags such as <br/>.
+def build_empty_marker(marker_number: int) -> str:
+    return "⟦EMPTY_" + str(marker_number) + "⟧"
+
+
+# This function builds the opening HTML for a tag.
+# We reconstruct the opening tag from the original tag name and original attributes.
+def build_opening_tag_html(tag: Tag) -> str:
+    pieces = []
+    pieces.append("<")
+    pieces.append(tag.name)
+
+    for attr_name, attr_value in tag.attrs.items():
+        pieces.append(" ")
+        pieces.append(attr_name)
+        pieces.append('="')
+
+        if isinstance(attr_value, list):
+            value_parts = []
+            for item in attr_value:
+                value_parts.append(str(item))
+            pieces.append(" ".join(value_parts))
+        else:
+            pieces.append(str(attr_value))
+
+        pieces.append('"')
+
+    pieces.append(">")
+    return "".join(pieces)
+
+
+# This function builds a closing HTML tag such as </a>.
+def build_closing_tag_html(tag: Tag) -> str:
+    return "</" + tag.name + ">"
+
+
+# This function returns the plain visible text inside a protected tag.
+# We use this so the model can still see the protected words for context.
+def visible_text_for_protected_tag(tag: Tag) -> str:
+    return tag.get_text()
+
+
+# This function scans a block and replaces every protected bold tag with visible KEEP markers.
+# The model still sees the protected words, but our code later restores the original bold tag.
+def replace_protected_tags_with_keep_markers(block_html: str) -> Tuple[str, Dict[str, Dict[str, str]]]:
+    original_tag = extract_single_tag(block_html)
+
+    working_tag = BeautifulSoup(str(original_tag), "lxml").find(original_tag.name)
+    keep_map = {}
+    marker_number = 1
+
+    # We collect the protected descendants first because replacing nodes while iterating
+    # directly over descendants can be confusing and error-prone for beginners.
+    protected_nodes = []
+
+    for descendant in working_tag.descendants:
+        if isinstance(descendant, Tag):
+            if descendant.name in PROTECTED_TAGS:
+                protected_nodes.append(descendant)
+
+    for protected_tag in protected_nodes:
+        start_marker = build_keep_start_marker(marker_number)
+        end_marker = build_keep_end_marker(marker_number)
+        visible_text = visible_text_for_protected_tag(protected_tag)
+        full_marker_text = start_marker + visible_text + end_marker
+
+        marker_info = {}
+        marker_info["start_marker"] = start_marker
+        marker_info["end_marker"] = end_marker
+        marker_info["full_marker_text"] = full_marker_text
+        marker_info["original_html"] = str(protected_tag)
+        marker_info["visible_text"] = visible_text
+
+        keep_map[str(marker_number)] = marker_info
+
+        protected_tag.replace_with(NavigableString(full_marker_text))
+        marker_number = marker_number + 1
+
+    markerized_html = str(working_tag)
+    return markerized_html, keep_map
+
+
+# This function checks whether every protected KEEP marker survived exactly as expected.
+# If the model changed, removed, or duplicated a marker, this function reports an error.
+def validate_keep_markers(candidate_html: str, keep_map: Dict[str, Dict[str, str]]) -> List[str]:
+    errors = []
+
+    for marker_number, marker_info in keep_map.items():
+        marker_text = marker_info["full_marker_text"]
+        count = candidate_html.count(marker_text)
+
+        if count != 1:
+            error_message = (
+                "Protected marker " + marker_number + " should appear exactly once, "
+                "but it appeared " + str(count) + " times."
+            )
+            errors.append(error_message)
+
+    return errors
+
+
+# This function restores every KEEP marker back to its original protected HTML tag.
+def restore_keep_markers(candidate_html: str, keep_map: Dict[str, Dict[str, str]]) -> str:
+    restored_html = candidate_html
+
+    for marker_number, marker_info in keep_map.items():
+        marker_text = marker_info["full_marker_text"]
+        original_html = marker_info["original_html"]
+        restored_html = restored_html.replace(marker_text, original_html)
+
+    return restored_html
+
+
+# This helper walks through a node recursively and converts the inside of a table cell into
+# markerized text. Protected tags become KEEP markers. Editable inline tags become TAG markers.
+def node_to_marker_text_for_cell(
+    node,
+    inline_map: Dict[str, Dict[str, str]],
+    keep_map: Dict[str, Dict[str, str]],
+    marker_counters: Dict[str, int],
+) -> str:
+    # Case 1: normal text node
+    if isinstance(node, NavigableString):
+        return str(node)
+
+    # Case 2: only Tag objects below this point
+    if not isinstance(node, Tag):
+        return ""
+
+    # Protected bold tags become KEEP markers.
+    if node.name in PROTECTED_TAGS:
+        keep_number = marker_counters["keep"]
+        marker_counters["keep"] = marker_counters["keep"] + 1
+
+        start_marker = build_keep_start_marker(keep_number)
+        end_marker = build_keep_end_marker(keep_number)
+        visible_text = visible_text_for_protected_tag(node)
+        full_marker_text = start_marker + visible_text + end_marker
+
+        marker_info = {}
+        marker_info["start_marker"] = start_marker
+        marker_info["end_marker"] = end_marker
+        marker_info["full_marker_text"] = full_marker_text
+        marker_info["original_html"] = str(node)
+        marker_info["visible_text"] = visible_text
+
+        keep_map[str(keep_number)] = marker_info
+        return full_marker_text
+
+    # Empty tags such as <br/> become one simple EMPTY marker.
+    if len(node.contents) == 0:
+        empty_number = marker_counters["empty"]
+        marker_counters["empty"] = marker_counters["empty"] + 1
+
+        empty_marker = build_empty_marker(empty_number)
+
+        marker_info = {}
+        marker_info["empty_marker"] = empty_marker
+        marker_info["original_html"] = str(node)
+
+        inline_map["EMPTY_" + str(empty_number)] = marker_info
+        return empty_marker
+
+    # Other editable inline tags become paired start/end markers.
+    inline_number = marker_counters["inline"]
+    marker_counters["inline"] = marker_counters["inline"] + 1
+
+    start_marker = build_inline_start_marker(inline_number)
+    end_marker = build_inline_end_marker(inline_number)
+
+    marker_info = {}
+    marker_info["start_marker"] = start_marker
+    marker_info["end_marker"] = end_marker
+    marker_info["opening_html"] = build_opening_tag_html(node)
+    marker_info["closing_html"] = build_closing_tag_html(node)
+    marker_info["tag_name"] = node.name
+
+    inline_map[str(inline_number)] = marker_info
+
+    child_text_parts = []
+
+    for child in node.contents:
+        child_text = node_to_marker_text_for_cell(child, inline_map, keep_map, marker_counters)
+        child_text_parts.append(child_text)
+
+    inner_text = "".join(child_text_parts)
+    return start_marker + inner_text + end_marker
+
+
+# This function converts the inside of a table cell into markerized text.
+# The outer <td> or <th> tag stays as HTML, but the inside becomes marker-friendly text.
+def prepare_cell_html_with_markers(cell_html: str) -> Tuple[str, Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    original_tag = extract_single_tag(cell_html)
+
+    if original_tag.name not in CELL_BLOCK_TAGS:
+        raise ValueError("Cell marker preparation expects a <td> or <th> block.")
+
+    inline_map = {}
+    keep_map = {}
+
+    marker_counters = {}
+    marker_counters["inline"] = 1
+    marker_counters["keep"] = 1
+    marker_counters["empty"] = 1
+
+    inner_text_parts = []
+
+    for child in original_tag.contents:
+        child_text = node_to_marker_text_for_cell(child, inline_map, keep_map, marker_counters)
+        inner_text_parts.append(child_text)
+
+    inner_marker_text = "".join(inner_text_parts)
+
+    opening_html = build_opening_tag_html(original_tag)
+    closing_html = build_closing_tag_html(original_tag)
+    prepared_html = opening_html + inner_marker_text + closing_html
+
+    return prepared_html, inline_map, keep_map
+
+
+# This function checks that each inline marker appears exactly once in the model output.
+def validate_inline_marker_counts(candidate_html: str, inline_map: Dict[str, Dict[str, str]]) -> List[str]:
+    errors = []
+
+    for marker_number, marker_info in inline_map.items():
+        if marker_number.startswith("EMPTY_"):
+            empty_marker = marker_info["empty_marker"]
+            empty_count = candidate_html.count(empty_marker)
+
+            if empty_count != 1:
+                error_message = (
+                    "Empty marker " + empty_marker + " should appear exactly once, "
+                    "but it appeared " + str(empty_count) + " times."
+                )
+                errors.append(error_message)
+
+            continue
+
+        start_marker = marker_info["start_marker"]
+        end_marker = marker_info["end_marker"]
+
+        start_count = candidate_html.count(start_marker)
+        end_count = candidate_html.count(end_marker)
+
+        if start_count != 1:
+            error_message = (
+                "Start marker " + start_marker + " should appear exactly once, "
+                "but it appeared " + str(start_count) + " times."
+            )
+            errors.append(error_message)
+
+        if end_count != 1:
+            error_message = (
+                "End marker " + end_marker + " should appear exactly once, "
+                "but it appeared " + str(end_count) + " times."
+            )
+            errors.append(error_message)
+
+    return errors
+
+
+# This function checks whether the inline start and end markers are properly balanced.
+# We scan the output from left to right and use a stack to make sure the nesting is valid.
+def validate_inline_marker_balance(candidate_html: str, inline_map: Dict[str, Dict[str, str]]) -> List[str]:
+    errors = []
+
+    token_pattern = r"⟦[A-Z0-9_]+⟧"
+    tokens = re.findall(token_pattern, candidate_html)
+
+    start_to_number = {}
+    end_to_number = {}
+
+    for marker_number, marker_info in inline_map.items():
+        if marker_number.startswith("EMPTY_"):
+            continue
+        start_to_number[marker_info["start_marker"]] = marker_number
+        end_to_number[marker_info["end_marker"]] = marker_number
+
+    stack = []
+
+    for token in tokens:
+        if token in start_to_number:
+            marker_number = start_to_number[token]
+            stack.append(marker_number)
+            continue
+
+        if token in end_to_number:
+            marker_number = end_to_number[token]
+
+            if len(stack) == 0:
+                errors.append("Found end marker " + token + " before any matching start marker.")
+                continue
+
+            last_open_number = stack[len(stack) - 1]
+
+            if last_open_number != marker_number:
+                errors.append("Marker nesting is not balanced around " + token + ".")
+                continue
+
+            stack.pop()
+
+    if len(stack) > 0:
+        errors.append("Some inline markers were opened but not closed correctly.")
+
+    return errors
+
+
+# This function restores editable inline markers and protected KEEP markers back to HTML.
+def restore_all_markers(candidate_html: str, inline_map: Dict[str, Dict[str, str]], keep_map: Dict[str, Dict[str, str]]) -> str:
+    restored_html = candidate_html
+
+    # First restore protected KEEP markers.
+    for marker_number, marker_info in keep_map.items():
+        marker_text = marker_info["full_marker_text"]
+        original_html = marker_info["original_html"]
+        restored_html = restored_html.replace(marker_text, original_html)
+
+    # Then restore empty markers such as <br/>.
+    for marker_number, marker_info in inline_map.items():
+        if marker_number.startswith("EMPTY_"):
+            empty_marker = marker_info["empty_marker"]
+            original_html = marker_info["original_html"]
+            restored_html = restored_html.replace(empty_marker, original_html)
+
+    # Finally restore paired inline start/end markers.
+    for marker_number, marker_info in inline_map.items():
+        if marker_number.startswith("EMPTY_"):
+            continue
+
+        start_marker = marker_info["start_marker"]
+        end_marker = marker_info["end_marker"]
+        opening_html = marker_info["opening_html"]
+        closing_html = marker_info["closing_html"]
+
+        restored_html = restored_html.replace(start_marker, opening_html)
+        restored_html = restored_html.replace(end_marker, closing_html)
+
+    return restored_html
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Validation
+# MAGIC
+# MAGIC After the model rewrites a block, we validate the result.
+# MAGIC
+# MAGIC The validator checks:
+# MAGIC
+# MAGIC - the result still parses as a single block
+# MAGIC - the root tag is still the same
+# MAGIC - root attributes are still the same
+# MAGIC - descendant tag structure is still the same after marker restoration
+# MAGIC - protected markers survived unchanged before restoration
+
+# COMMAND ----------
+
+# This function validates a rewritten block after all markers have already been restored.
+def validate_restored_block(original_html: str, candidate_html: str) -> Dict[str, object]:
+    result = {}
+    result["is_valid"] = True
+    result["errors"] = []
+
+    try:
+        original_tag = extract_single_tag(original_html)
+    except Exception as exc:
+        result["is_valid"] = False
+        result["errors"].append("Original block could not be parsed: " + str(exc))
+        return result
+
+    try:
+        candidate_tag = extract_single_tag(candidate_html)
+    except Exception as exc:
+        result["is_valid"] = False
+        result["errors"].append("Candidate block could not be parsed: " + str(exc))
+        return result
+
+    if original_tag.name != candidate_tag.name:
+        result["is_valid"] = False
+        result["errors"].append(
+            "Root tag changed from <" + original_tag.name + "> to <" + candidate_tag.name + ">."
+        )
+
+    if normalize_attrs(original_tag) != normalize_attrs(candidate_tag):
+        result["is_valid"] = False
+        result["errors"].append("Root tag attributes changed.")
+
+    original_signature = structure_signature(original_tag)
+    candidate_signature = structure_signature(candidate_tag)
+
+    if original_signature != candidate_signature:
+        result["is_valid"] = False
+        result["errors"].append(
+            "Tag structure changed. A tag moved, disappeared, or a new tag was introduced."
+        )
+
+    return result
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Prompt helpers
+# MAGIC
+# MAGIC We use two different prompts:
+# MAGIC
+# MAGIC - one for raw HTML blocks
+# MAGIC - one for table cells with markers
+
+# COMMAND ----------
+
+RAW_HTML_SYSTEM_PROMPT = """
+You rewrite one HTML block according to style rules.
+
+Important requirements:
+- Return HTML only for the same single root block you received.
+- Preserve the root tag, all descendant tag names, all nesting, and all attributes.
+- Do not add tags.
+- Do not remove tags.
+- Do not move tags to a different position in the tree.
+- Text inside child tags flows as part of the sentence.
+- Markers like ⟦KEEP_1_START⟧...⟦KEEP_1_END⟧ are protected text spans.
+- Preserve every KEEP marker span exactly as written.
+- Do not wrap the answer in markdown fences.
+- Do not add explanations.
+""".strip()
+
+
+CELL_MARKER_SYSTEM_PROMPT = """
+You rewrite one table cell according to style rules.
+
+Important requirements:
+- Return HTML only for the same single root cell tag you received.
+- Preserve the outer cell tag and its attributes exactly.
+- Markers like ⟦TAG_1_START⟧...⟦TAG_1_END⟧ represent editable inline tags.
+- Preserve all markers exactly as written.
+- You may rewrite the normal text and the text between editable tag markers.
+- Markers like ⟦KEEP_1_START⟧...⟦KEEP_1_END⟧ are protected text spans.
+- Preserve every KEEP marker span exactly as written.
+- Do not invent new markers.
+- Do not remove markers.
+- Do not wrap the answer in markdown fences.
+- Do not add explanations.
+""".strip()
+
+
+# This function formats the style rules as a numbered list for the prompt.
+def format_rules(rules: Sequence[str]) -> str:
+    lines = []
+
+    rule_number = 1
+    for rule in rules:
+        lines.append(str(rule_number) + ". " + rule)
+        rule_number = rule_number + 1
+
+    return "\n".join(lines)
+
+
+# This function removes markdown code fences if the model adds them anyway.
+def strip_code_fences(text: str) -> str:
+    if not text:
+        return text
+
+    cleaned_text = text.strip()
+
+    fence_match = re.match(
+        r"^```(?:html)?\s*(.*?)\s*```$",
+        cleaned_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    return cleaned_text
+
+
+# This function builds the user prompt for raw HTML blocks.
+def build_raw_html_user_prompt(
+    prepared_html: str,
+    rules: Sequence[str],
+    repair_errors: Optional[Sequence[str]] = None,
+) -> str:
+    prompt = ""
+    prompt = prompt + "Apply the following rules to this HTML block.\n\n"
+    prompt = prompt + "Rules:\n"
+    prompt = prompt + format_rules(rules)
+    prompt = prompt + "\n\n"
+    prompt = prompt + "HTML block:\n"
+    prompt = prompt + prepared_html
+
+    if repair_errors:
+        prompt = prompt + "\n\n"
+        prompt = prompt + "Your previous answer failed validation for these reasons:\n"
+
+        for error in repair_errors:
+            prompt = prompt + "- " + error + "\n"
+
+        prompt = prompt + "\nRepair the HTML while keeping the same structure and markers."
+
+    return prompt
+
+
+# This function builds the user prompt for table cells that use inline markers.
+def build_cell_user_prompt(
+    prepared_html: str,
+    rules: Sequence[str],
+    repair_errors: Optional[Sequence[str]] = None,
+) -> str:
+    prompt = ""
+    prompt = prompt + "Apply the following rules to this table cell.\n\n"
+    prompt = prompt + "Rules:\n"
+    prompt = prompt + format_rules(rules)
+    prompt = prompt + "\n\n"
+    prompt = prompt + "HTML cell:\n"
+    prompt = prompt + prepared_html
+
+    if repair_errors:
+        prompt = prompt + "\n\n"
+        prompt = prompt + "Your previous answer failed validation for these reasons:\n"
+
+        for error in repair_errors:
+            prompt = prompt + "- " + error + "\n"
+
+        prompt = prompt + "\nRepair the HTML while keeping the same cell tag and the same markers."
+
+    return prompt
+
+
+# This function sends one prepared block to Azure OpenAI and returns the model text.
+def call_model(
+    client: AzureOpenAI,
+    deployment_name: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    completion = client.chat.completions.create(
+        model=deployment_name,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    content = completion.choices[0].message.content
+
+    if content is None:
+        return ""
+
+    return strip_code_fences(content)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Rewrite functions
+# MAGIC
+# MAGIC There are two rewrite paths:
+# MAGIC
+# MAGIC 1. **Raw HTML path**
+# MAGIC    - used for paragraphs, list items, headings, and captions
+# MAGIC 2. **Cell marker path**
+# MAGIC    - used for `<td>` and `<th>`
+
+# COMMAND ----------
+
+# This function rewrites one raw HTML block.
+# Before the model sees the block, protected bold tags are replaced with visible KEEP markers.
+# After the model returns HTML, the original protected tags are restored and validated.
+def rewrite_raw_html_block(
+    client: AzureOpenAI,
+    deployment_name: str,
+    block_html: str,
+    rules: Sequence[str],
+    max_attempts: int = 3,
+) -> Dict[str, object]:
+    prepared_html, keep_map = replace_protected_tags_with_keep_markers(block_html)
+
+    result = {}
+    result["strategy"] = "raw_html"
+    result["original_html"] = block_html
+    result["prepared_html"] = prepared_html
+    result["rewritten_html"] = block_html
+    result["restored_html"] = block_html
+    result["attempts"] = 0
+    result["is_valid"] = False
+    result["errors"] = []
+
+    repair_errors = None
+
+    for attempt_number in range(1, max_attempts + 1):
+        user_prompt = build_raw_html_user_prompt(prepared_html, rules, repair_errors)
+        candidate_html = call_model(
+            client=client,
+            deployment_name=deployment_name,
+            system_prompt=RAW_HTML_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+        )
+
+        marker_errors = validate_keep_markers(candidate_html, keep_map)
+
+        if len(marker_errors) > 0:
+            result["rewritten_html"] = candidate_html
+            result["restored_html"] = candidate_html
+            result["attempts"] = attempt_number
+            result["is_valid"] = False
+            result["errors"] = marker_errors
+            repair_errors = marker_errors
+            continue
+
+        restored_html = restore_keep_markers(candidate_html, keep_map)
+        validation = validate_restored_block(block_html, restored_html)
+
+        result["rewritten_html"] = candidate_html
+        result["restored_html"] = restored_html
+        result["attempts"] = attempt_number
+        result["is_valid"] = validation["is_valid"]
+        result["errors"] = validation["errors"]
+
+        if validation["is_valid"]:
+            return result
+
+        repair_errors = validation["errors"]
+
+    return result
+
+
+# This function rewrites one table cell.
+# The outer cell tag remains HTML, but the inside uses markers for inline tags and protected spans.
+def rewrite_table_cell_block(
+    client: AzureOpenAI,
+    deployment_name: str,
+    block_html: str,
+    rules: Sequence[str],
+    max_attempts: int = 3,
+) -> Dict[str, object]:
+    prepared_html, inline_map, keep_map = prepare_cell_html_with_markers(block_html)
+
+    result = {}
+    result["strategy"] = "cell_markers"
+    result["original_html"] = block_html
+    result["prepared_html"] = prepared_html
+    result["rewritten_html"] = block_html
+    result["restored_html"] = block_html
+    result["attempts"] = 0
+    result["is_valid"] = False
+    result["errors"] = []
+
+    repair_errors = None
+
+    for attempt_number in range(1, max_attempts + 1):
+        user_prompt = build_cell_user_prompt(prepared_html, rules, repair_errors)
+        candidate_html = call_model(
+            client=client,
+            deployment_name=deployment_name,
+            system_prompt=CELL_MARKER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+        )
+
+        errors = []
+
+        keep_errors = validate_keep_markers(candidate_html, keep_map)
+        for error in keep_errors:
+            errors.append(error)
+
+        count_errors = validate_inline_marker_counts(candidate_html, inline_map)
+        for error in count_errors:
+            errors.append(error)
+
+        balance_errors = validate_inline_marker_balance(candidate_html, inline_map)
+        for error in balance_errors:
+            errors.append(error)
+
+        if len(errors) > 0:
+            result["rewritten_html"] = candidate_html
+            result["restored_html"] = candidate_html
+            result["attempts"] = attempt_number
+            result["is_valid"] = False
+            result["errors"] = errors
+            repair_errors = errors
+            continue
+
+        restored_html = restore_all_markers(candidate_html, inline_map, keep_map)
+        validation = validate_restored_block(block_html, restored_html)
+
+        result["rewritten_html"] = candidate_html
+        result["restored_html"] = restored_html
+        result["attempts"] = attempt_number
+        result["is_valid"] = validation["is_valid"]
+        result["errors"] = validation["errors"]
+
+        if validation["is_valid"]:
+            return result
+
+        repair_errors = validation["errors"]
+
+    return result
+
+
+# This function chooses the right strategy for one leaf block.
+def rewrite_one_block(
+    client: AzureOpenAI,
+    deployment_name: str,
+    block_html: str,
+    block_tag_name: str,
+    rules: Sequence[str],
+    max_attempts: int = 3,
+) -> Dict[str, object]:
+    if block_tag_name in CELL_BLOCK_TAGS:
+        return rewrite_table_cell_block(
+            client=client,
+            deployment_name=deployment_name,
+            block_html=block_html,
+            rules=rules,
+            max_attempts=max_attempts,
+        )
+
+    return rewrite_raw_html_block(
+        client=client,
+        deployment_name=deployment_name,
+        block_html=block_html,
+        rules=rules,
+        max_attempts=max_attempts,
+    )
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Whole-fragment transformation
+# MAGIC
+# MAGIC This function:
+# MAGIC
+# MAGIC 1. parses the whole document
+# MAGIC 2. finds the leaf blocks
+# MAGIC 3. rewrites each leaf block
+# MAGIC 4. replaces the old block with the restored rewritten block
+# MAGIC 5. returns the final HTML fragment and a detailed report
+
+# COMMAND ----------
+
+# This function transforms a full HTML fragment by rewriting each leaf block independently.
+def transform_html_fragment(
+    fragment: str,
+    client: AzureOpenAI,
+    deployment_name: str,
+    rules: Sequence[str],
+    max_attempts_per_block: int = 3,
+    fail_on_validation_error: bool = True,
+) -> Tuple[str, List[Dict[str, object]]]:
+    soup, root = parse_fragment(fragment)
+    targets = find_leaf_rewrite_targets(root)
+
+    report = []
+    block_index = 1
+
+    for tag in targets:
+        original_html = str(tag)
+        block_tag_name = tag.name
+
+        rewrite_result = rewrite_one_block(
+            client=client,
+            deployment_name=deployment_name,
+            block_html=original_html,
+            block_tag_name=block_tag_name,
+            rules=rules,
+            max_attempts=max_attempts_per_block,
+        )
+
+        report_item = {}
+        report_item["index"] = block_index
+        report_item["tag"] = block_tag_name
+        report_item["strategy"] = rewrite_result["strategy"]
+        report_item["attempts"] = rewrite_result["attempts"]
+        report_item["is_valid"] = rewrite_result["is_valid"]
+        report_item["errors"] = rewrite_result["errors"]
+        report_item["original_html"] = rewrite_result["original_html"]
+        report_item["prepared_html"] = rewrite_result["prepared_html"]
+        report_item["rewritten_html"] = rewrite_result["rewritten_html"]
+        report_item["restored_html"] = rewrite_result["restored_html"]
+
+        report.append(report_item)
+
+        if rewrite_result["is_valid"]:
+            replacement_tag = extract_single_tag(rewrite_result["restored_html"])
+            tag.replace_with(replacement_tag)
+        else:
+            if fail_on_validation_error:
+                error_text = "; ".join(rewrite_result["errors"])
+                raise ValueError(
+                    "Validation failed for block "
+                    + str(block_index)
+                    + " <"
+                    + block_tag_name
+                    + ">: "
+                    + error_text
+                )
+
+        block_index = block_index + 1
+
+    final_html = fragment_to_string(root)
+    return final_html, report
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Preview helpers
+# MAGIC
+# MAGIC These helpers are useful when you want to understand exactly what the model sees.
+
+# COMMAND ----------
+
+# This function previews the prepared version of one block.
+# It does not call the model. It only shows the intermediate text that would be sent.
+def preview_prepared_block(block_html: str) -> Dict[str, object]:
+    tag = extract_single_tag(block_html)
+
+    if tag.name in CELL_BLOCK_TAGS:
+        prepared_html, inline_map, keep_map = prepare_cell_html_with_markers(block_html)
+        return {
+            "strategy": "cell_markers",
+            "prepared_html": prepared_html,
+            "inline_map": inline_map,
+            "keep_map": keep_map,
+        }
+
+    prepared_html, keep_map = replace_protected_tags_with_keep_markers(block_html)
+    return {
+        "strategy": "raw_html",
+        "prepared_html": prepared_html,
+        "inline_map": {},
+        "keep_map": keep_map,
+    }
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Example input
+
+# COMMAND ----------
+example_html = """
+<p>Today is Sunday. Sunday are a great day as they have a lot of <a href="/activities">activitties</a>.</p>
+<ol>
+  <li>We got park on Sunday and eat in a nice restaurants</li>
+  <li>This is <strong>Early Years Plus</strong> for childrens on Sunday</li>
+</ol>
+<table>
+  <tr>
+    <th>Servce</th>
+    <th>Descrption</th>
+  </tr>
+  <tr>
+    <td><a href="/kids">Kids activitties</a></td>
+    <td>This is <strong>fixed wording</strong> for Sunday programe.</td>
+  </tr>
+</table>
+""".strip()
+
+print(example_html)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Preview how one paragraph is prepared
+
+# COMMAND ----------
+paragraph_preview = preview_prepared_block(
+    '<p>This is <strong>fixed wording</strong> for childrens on Sunday.</p>'
+)
+
+print("Strategy:", paragraph_preview["strategy"])
+print(paragraph_preview["prepared_html"])
+print(json.dumps(paragraph_preview["keep_map"], indent=2, ensure_ascii=False))
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Preview how one table cell is prepared
+
+# COMMAND ----------
+cell_preview = preview_prepared_block(
+    '<td><a href="/kids">Kids activitties</a> and <strong>Early Years Plus</strong></td>'
+)
+
+print("Strategy:", cell_preview["strategy"])
+print(cell_preview["prepared_html"])
+print(json.dumps(cell_preview["inline_map"], indent=2, ensure_ascii=False))
+print(json.dumps(cell_preview["keep_map"], indent=2, ensure_ascii=False))
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Run the transformation
+# MAGIC
+# MAGIC This will fail fast if any block breaks validation.
+
+# COMMAND ----------
+rewritten_html, rewrite_report = transform_html_fragment(
+    fragment=example_html,
+    client=client,
+    deployment_name=AZURE_OPENAI_DEPLOYMENT,
+    rules=STYLE_RULES,
+    max_attempts_per_block=3,
+    fail_on_validation_error=True,
+)
+
+print(rewritten_html)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Inspect the per-block report
+
+# COMMAND ----------
+for item in rewrite_report:
+    print(json.dumps(item, indent=2, ensure_ascii=False))
+    print("-" * 80)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Notes and limitations
+# MAGIC
+# MAGIC 1. This notebook is designed to be easy to understand first, and easy to optimize later.
+# MAGIC 2. For some nested list structures, an outer `<li>` that contains another block may be skipped
+# MAGIC    because the notebook rewrites only leaf blocks.
+# MAGIC 3. The validator checks structure carefully, but it cannot guarantee perfect writing quality.
+# MAGIC 4. If you need even stricter control, you can extend the marker strategy to more block types.
+# MAGIC 5. If you need more immutable tags, add them to `PROTECTED_TAGS`.
