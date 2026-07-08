@@ -1,16 +1,4 @@
 
-
-from google import genai
-
-client = genai.Client(api_key="")
-
-response = client.models.generate_content(
-    model="gemini-2.5-flash",
-    contents="Say hello in Dutch in one short sentence."
-)
-
-print(response.text)
-
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
